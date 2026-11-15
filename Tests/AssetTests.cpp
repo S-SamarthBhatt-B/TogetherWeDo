@@ -135,6 +135,7 @@ int main() {
     std::filesystem::path registry_path = directory / ".together" / "asset_registry.json";
     std::ifstream registry_file(registry_path, std::ios::binary);
     const std::string registry_text((std::istreambuf_iterator<char>(registry_file)), std::istreambuf_iterator<char>());
+    registry_file.close();
     ok &= check(registry_text.find("\"version\": 2") != std::string::npos &&
         registry_text.find(std::filesystem::absolute(directory).string()) == std::string::npos,
         "registry stores version 2 project-relative paths rather than absolute project locations");
@@ -164,7 +165,9 @@ int main() {
     std::string delete_error;
     ok &= check(!pipeline.remove_asset(imported_id, protected_asset, &delete_error) &&
         pipeline.find(imported_id, resolved), "referenced assets are protected from deletion");
-    ok &= check(pipeline.remove_asset(imported_id, {}, &delete_error), "unreferenced asset deletion invalidates the registry and cache");
+    const bool asset_deleted = pipeline.remove_asset(imported_id, {}, &delete_error);
+    if (!asset_deleted) std::cerr << "Asset deletion detail: " << delete_error << '\\n';
+    ok &= check(asset_deleted, "unreferenced asset deletion invalidates the registry and cache");
     ok &= check(!std::filesystem::exists(managed_package), "asset deletion removes the managed package directory");
     ok &= check(!pipeline.resolve(removed_handle, resolved) && !pipeline.find(imported_id, resolved),
         "removed asset handles and IDs no longer resolve");

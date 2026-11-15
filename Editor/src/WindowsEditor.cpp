@@ -92,8 +92,9 @@ enum MenuId : UINT {
     MenuNew = 1000, MenuOpen, MenuSave, MenuSaveAs, MenuExit,
     MenuDelete = 1020, MenuDuplicate, MenuResetTransform,
     MenuValidate = 1040, MenuCreateCube = 1060,
-    MenuOpenSceneFolder = 1080, MenuResetLayout, MenuFocusViewport,
-    MenuAbout = 1100
+    MenuOpenSceneFolder = 1080,
+    MenuResetLayout = 1110, MenuFocusViewport = 1111,
+    MenuAbout = 1120
 };
 
 enum class LogKind { Info, Build, Warning, Error };
@@ -1069,8 +1070,8 @@ void paint_asset_preview(const DRAWITEMSTRUCT& draw) {
     if (!g_app->assets->find(entry.asset_id, metadata)) return;
     const auto payload = g_app->assets->payload(metadata.handle);
     if (!payload) return;
-    const int width = (std::max)(1, area.right - area.left - 8);
-    const int height = (std::max)(1, area.bottom - area.top - 8);
+    const int width = (std::max)(1, static_cast<int>(area.right - area.left) - 8);
+    const int height = (std::max)(1, static_cast<int>(area.bottom - area.top) - 8);
     BITMAPINFO bitmap{};
     bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bitmap.bmiHeader.biWidth = 128;
@@ -1408,8 +1409,8 @@ void perform_browser_drop(const POINT screen_point) {
     if (metadata.type == together::assets::AssetType::Model) {
         SceneObject& object = g_app->scene.create_object(metadata.name);
         object.model_asset_id = metadata.id;
-        const int viewport_width = (std::max)(1, viewport_rect.right - viewport_rect.left);
-        const int viewport_height = (std::max)(1, viewport_rect.bottom - viewport_rect.top);
+        const int viewport_width = (std::max)(1, static_cast<int>(viewport_rect.right - viewport_rect.left));
+        const int viewport_height = (std::max)(1, static_cast<int>(viewport_rect.bottom - viewport_rect.top));
         object.transform.position.x = static_cast<float>(screen_point.x - (viewport_rect.left + viewport_width / 2)) * 0.025f;
         object.transform.position.z = static_cast<float>((viewport_rect.top + viewport_height / 2) - screen_point.y) * 0.025f;
         g_app->selected_id = object.id;
@@ -2014,8 +2015,8 @@ LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
             }
             return 0;
         case IdAssetRefresh:
-            for (const auto& message : g_app->assets->restore_missing_assets())
-                append_console(LogKind::Warning, L"Asset registry recovery: " + to_wide(message));
+            for (const auto& recovery_message : g_app->assets->restore_missing_assets())
+                append_console(LogKind::Warning, L"Asset registry recovery: " + to_wide(recovery_message));
             refresh_asset_browser();
             return 0;
         case IdAssetRename: rename_selected_browser_asset(); return 0;

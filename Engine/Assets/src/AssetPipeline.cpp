@@ -422,8 +422,10 @@ bool import_model(const std::filesystem::path& path, ModelData& model, AssetMeta
                     imported.metallic = source.pbr_metallic_roughness.metallic_factor;
                     imported.roughness = source.pbr_metallic_roughness.roughness_factor;
                     imported.texture_uris[0] = texture_uri(source.pbr_metallic_roughness.base_color_texture);
-                    imported.texture_uris[2] = texture_uri(source.pbr_metallic_roughness.roughness_texture);
-                    imported.texture_uris[3] = texture_uri(source.pbr_metallic_roughness.metallic_texture);
+                    const std::string metallic_roughness_uri =
+                        texture_uri(source.pbr_metallic_roughness.metallic_roughness_texture);
+                    imported.texture_uris[2] = metallic_roughness_uri;
+                    imported.texture_uris[3] = metallic_roughness_uri;
                 }
                 imported.texture_uris[1] = texture_uri(source.normal_texture);
                 imported.texture_uris[4] = texture_uri(source.occlusion_texture);

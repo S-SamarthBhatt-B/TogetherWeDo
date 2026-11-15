@@ -10,7 +10,7 @@ if(NOT WIN32)
 endif()
 
 if(MSVC AND MSVC_VERSION LESS 1930)
-    message(FATAL_ERROR "Together Engine requires Visual Studio 2022 (MSVC 19.30 or newer).")
+    message(FATAL_ERROR "Together Engine requires Visual Studio 2022 or newer (MSVC 19.30 or newer).")
 endif()
 
 add_library(TogetherEngineCore STATIC
@@ -40,7 +40,7 @@ add_library(TogetherEngineAssets STATIC
     Engine/Assets/src/ThirdPartyImplementations.cpp
 )
 target_include_directories(TogetherEngineAssets PUBLIC Engine/Assets/include
-    PRIVATE ThirdParty/cgltf ThirdParty/stb ThirdParty/dr_libs ThirdParty/nlohmann)
+    PRIVATE ThirdParty/cgltf ThirdParty/stb ThirdParty/dr_libs ThirdParty)
 target_compile_features(TogetherEngineAssets PUBLIC cxx_std_20)
 target_link_libraries(TogetherEngineAssets PUBLIC bcrypt)
 target_compile_definitions(TogetherEngineAssets PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)
