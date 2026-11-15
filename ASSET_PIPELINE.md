@@ -8,9 +8,11 @@ This document describes implementation present on `feature/milestone-3b-completi
 
 `TogetherEngineAssets` accepts PNG, JPEG, TGA, static glTF 2.0 (`.gltf` and `.glb`), WAV, and `.twmat.json`. Image/model/audio size limits and glTF validation are enforced during import. Images decode to RGBA8, are downscaled according to the import quality, and receive a CPU-generated box-filter mip chain. Static model import extracts triangle primitives, positions, normals, UVs, tangents (or derives tangents from UVs), material factors, and supported node transforms. WAV is decoded to float PCM; playback is not implemented.
 
-Asset IDs are type-qualified SHA-256 hashes. The runtime registry still uses generation-checked handles and decoded-payload caching. The editor's registry index is persisted to `.together/asset_registry.json` under the configured project root. It records each content ID and the absolute source path; startup reimports available sources and the editor rebuilds D3D resources. Missing, changed, malformed, or invalid source records are reported. This supports reopen on the same machine while source files remain at the same paths. The index does not copy assets into the project, so it is not a portable asset package; moving a source file or project to another machine requires relinking/reimporting.
+Asset IDs are type-qualified SHA-256 hashes. The runtime registry uses generation-checked handles and decoded-payload caching. The editor persists the registry at `.together/asset_registry.json`; version 2 records paths relative to the project root. Successful imports are copied into `Assets/<type>/<sha256>/`. glTF files with external buffers/images retain their URI-relative layout inside that package. The project, registry, and imported sources can therefore move together to another Windows directory. The editor finds the project root by walking up from its executable, with the configured source root as a fallback.
 
-The registry file is editor-generated and ignored by Git. Source assets stay wherever the user imported them from. For reliable project handoff, keep source assets in a shared project folder and do not move them after import.
+At startup the registry validates its version, ID shape, entry structure, duplicates, path containment, file presence, and imported content. Valid sources are re-imported into runtime payloads and GPU resources are rebuilt by the editor. Missing v2 sources remain in the registry for recovery; browser Refresh retries restoration after a missing file is returned. Changed or invalid content is reported and is not silently accepted. Version 1 absolute entries migrate by importing and staging their source when it still exists. A missing legacy absolute source cannot be made portable automatically and is reported.
+
+Importing from outside the project leaves that original file untouched and creates a project-owned copy. Rename changes the managed filename while retaining the stable content ID. Delete updates the registry and managed package transactionally, invalidates runtime cache state, and is refused while referenced by the current scene, a valid saved `.tws.json` scene, or a registered material. The editor confirms deletion first. A malformed scene or failed project scan blocks deletion conservatively. The registry file is editor-generated and ignored by Git.
 
 ## Editor Asset Browser
 
@@ -18,12 +20,12 @@ The native editor has a docked browser in the left panel with:
 
 - Directory path entry, Go and Up navigation, and folder entries for browsing.
 - Asset name search and filters for models, textures, materials, and audio.
-- File and registered-asset rows, Refresh, and Import controls. Double-clicking a supported file imports it.
+- File and registered-asset rows, Refresh, Import, Rename and Delete controls. Double-clicking a supported file imports it. Rename stays inside the managed package and preserves the extension; Delete confirms and checks scene/material references.
 - A metadata panel showing texture dimensions/mips/decoded bytes, model primitive/vertex/index counts, or audio channels and decoded size.
 - A texture preview drawn from decoded image pixels, a mesh preview drawn from imported triangles, and a software-lit material sphere preview using material factors and the base-color texture when available.
 - Browser drag-and-drop: drag a registered model into the viewport to create an instance. Drag a material onto a selected object to assign it. Drag a texture onto the viewport to assign base color; hold Shift for normal, Ctrl for metallic/roughness, or Alt for ambient occlusion.
 
-The material preview is a CPU/GDI approximation and does not run the D3D11 material shader. Audio has metadata but no waveform or playback preview. Browser rename/delete and a persistent project-relative content-addressed asset store are not implemented.
+The material preview is a CPU/GDI approximation and does not run the D3D11 material shader. Audio has metadata but no waveform or playback preview. The browser is a native directory/list interface rather than a tree/grid workspace, and preview pixels are generated on demand rather than held in a bounded thumbnail cache.
 
 ## Materials and rendered texture maps
 
@@ -41,7 +43,7 @@ External glTF buffers are resolved relative to the source `.gltf`, but the asset
 
 ## Verification
 
-Tests are authored for material serialization/validation, asset registration and handle generations, duplicate detection, cache invalidation, texture metadata/mips, invalid assets, glTF geometry extraction, registry persistence/reload, malformed registry data, and scene material-map reference round trips. They have **not run** on this feature branch because the current environment has no discoverable CMake, MSVC, CTest, or Visual Studio installation. GPU rendering and editor interactions have likewise not been run.
+Tests are authored for material serialization/validation, asset registration and handle generations, duplicate detection, cache invalidation, texture metadata/mips, invalid assets, glTF geometry extraction, registry persistence/reload, malformed and path-escaping registry data, project relocation, project-relative path records, v1 registry migration, rename persistence, referenced-delete protection, physical managed-package deletion, missing-source recovery, and scene material-map/reference queries. They have **not run** on this feature branch because the current environment has no discoverable CMake, MSVC, CTest, or Visual Studio installation. GPU rendering, editor interactions, and runtime migration have likewise not been run.
 
 On a Windows 10/11 x64 machine with Visual Studio 2022 Desktop development with C++, Windows SDK, and CMake 3.24+, run:
 

@@ -45,6 +45,11 @@ int main() {
     first.material.normal_texture_id = "texture:normal";
     first.material.metallic_roughness_texture_id = "texture:metalrough";
     first.material.occlusion_texture_id = "texture:occlusion";
+    passed &= check(scene.references_asset(first.model_asset_id) &&
+        scene.references_asset(first.material_asset_id) &&
+        scene.references_asset(first.material.normal_texture_id) &&
+        !scene.references_asset("texture:not-referenced"),
+        "scene reference queries cover model, material, and texture asset IDs");
     const std::string shared_model_id = first.model_asset_id;
     const std::string shared_material_id = first.material_asset_id;
     const std::string shared_texture_id = first.material.base_color_texture_id;
