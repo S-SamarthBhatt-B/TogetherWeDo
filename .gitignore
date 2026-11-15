@@ -62,3 +62,4 @@ credentials.*
 # Generated asset/import caches
 /DerivedDataCache/
 /.asset-cache/
+/.together/

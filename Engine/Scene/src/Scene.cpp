@@ -322,6 +322,12 @@ bool object_from_json(const JsonValue& value, SceneObject& result, std::string& 
     if (emission && !read_vec3(material, "emission", result.material.emission, error)) return false;
     const JsonValue* material_texture = property(material, "baseColorTextureAssetId");
     if (material_texture && !read_string(material, "baseColorTextureAssetId", result.material.base_color_texture_id, error)) return false;
+    const JsonValue* normal_texture = property(material, "normalTextureAssetId");
+    if (normal_texture && !read_string(material, "normalTextureAssetId", result.material.normal_texture_id, error)) return false;
+    const JsonValue* metallic_roughness_texture = property(material, "metallicRoughnessTextureAssetId");
+    if (metallic_roughness_texture && !read_string(material, "metallicRoughnessTextureAssetId", result.material.metallic_roughness_texture_id, error)) return false;
+    const JsonValue* occlusion_texture = property(material, "occlusionTextureAssetId");
+    if (occlusion_texture && !read_string(material, "occlusionTextureAssetId", result.material.occlusion_texture_id, error)) return false;
     const JsonValue* model_id = property(object, "modelAssetId");
     if (model_id && !read_string(object, "modelAssetId", result.model_asset_id, error)) return false;
     const JsonValue* material_id = property(object, "materialAssetId");
@@ -345,6 +351,12 @@ void write_object(std::ostream& output, const SceneObject& object) {
     write_vec3(output, object.material.emission);
     output << ",\n        \"baseColorTextureAssetId\": ";
     write_string(output, object.material.base_color_texture_id);
+    output << ",\n        \"normalTextureAssetId\": ";
+    write_string(output, object.material.normal_texture_id);
+    output << ",\n        \"metallicRoughnessTextureAssetId\": ";
+    write_string(output, object.material.metallic_roughness_texture_id);
+    output << ",\n        \"occlusionTextureAssetId\": ";
+    write_string(output, object.material.occlusion_texture_id);
     output << "\n      },\n      \"modelAssetId\": ";
     write_string(output, object.model_asset_id);
     output << ",\n      \"materialAssetId\": ";
@@ -408,7 +420,8 @@ bool Scene::validate(std::string& error) const {
         if (!ids.insert(object.id).second) { error = "Scene contains duplicate object ids."; return false; }
         if (object.name.empty() || object.name.size() > 256) { error = "Object names must contain 1–256 UTF-8 bytes."; return false; }
         if (object.model_asset_id.size() > 256 || object.material_asset_id.size() > 256 ||
-            object.material.base_color_texture_id.size() > 256) {
+            object.material.base_color_texture_id.size() > 256 || object.material.normal_texture_id.size() > 256 ||
+            object.material.metallic_roughness_texture_id.size() > 256 || object.material.occlusion_texture_id.size() > 256) {
             error = "Asset references cannot exceed 256 UTF-8 bytes.";
             return false;
         }

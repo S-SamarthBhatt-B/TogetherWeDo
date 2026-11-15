@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 #include <bcrypt.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,7 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <span>
 #include <type_traits>
@@ -272,15 +274,18 @@ bool import_model(const std::filesystem::path& path, ModelData& model, AssetMeta
             const cgltf_accessor* positions = nullptr;
             const cgltf_accessor* normals = nullptr;
             const cgltf_accessor* uvs = nullptr;
+            const cgltf_accessor* tangents = nullptr;
             for (cgltf_size attribute_index = 0; attribute_index < primitive.attributes_count; ++attribute_index) {
                 const auto& attribute = primitive.attributes[attribute_index];
                 if (attribute.type == cgltf_attribute_type_position) positions = attribute.data;
                 else if (attribute.type == cgltf_attribute_type_normal) normals = attribute.data;
                 else if (attribute.type == cgltf_attribute_type_texcoord && attribute.index == 0) uvs = attribute.data;
+                else if (attribute.type == cgltf_attribute_type_tangent) tangents = attribute.data;
             }
             if (!positions || positions->count == 0 || positions->count > kMaxModelVertices ||
                 vertex_total + positions->count > kMaxModelVertices ||
-                (normals && normals->count != positions->count) || (uvs && uvs->count != positions->count)) {
+                (normals && normals->count != positions->count) || (uvs && uvs->count != positions->count) ||
+                (tangents && tangents->count != positions->count)) {
                 error = "glTF primitive has missing/incompatible attributes or exceeds the 2-million-vertex import limit.";
                 return false;
             }
@@ -304,6 +309,13 @@ bool import_model(const std::filesystem::path& path, ModelData& model, AssetMeta
                     if (!cgltf_accessor_read_float(uvs, i, values, 2)) { error = "Could not decode glTF TEXCOORD_0 accessor."; return false; }
                     vertex.uv[0] = values[0]; vertex.uv[1] = values[1];
                     if (!std::isfinite(vertex.uv[0]) || !std::isfinite(vertex.uv[1])) { error = "glTF contains non-finite texture coordinates."; return false; }
+                }
+                if (tangents) {
+                    if (!cgltf_accessor_read_float(tangents, i, values, 4)) { error = "Could not decode glTF TANGENT accessor."; return false; }
+                    vertex.tangent[0] = values[0]; vertex.tangent[1] = values[1]; vertex.tangent[2] = -values[2]; vertex.tangent[3] = -values[3];
+                    if (!std::all_of(std::begin(vertex.tangent), std::end(vertex.tangent), [](float component) { return std::isfinite(component); })) {
+                        error = "glTF contains non-finite tangent vectors."; return false;
+                    }
                 }
                 for (float component : vertex.position) if (!std::isfinite(component)) { error = "glTF contains non-finite vertex positions."; return false; }
                 update_bounds(imported.bounds, vertex, i == 0);
@@ -350,6 +362,55 @@ bool import_model(const std::filesystem::path& path, ModelData& model, AssetMeta
                     const float length = std::sqrt(vertex.normal[0]*vertex.normal[0] + vertex.normal[1]*vertex.normal[1] + vertex.normal[2]*vertex.normal[2]);
                     if (length > 1e-8f) for (float& component : vertex.normal) component /= length;
                     else { vertex.normal[0] = 0; vertex.normal[1] = 1; vertex.normal[2] = 0; }
+                }
+            }
+            if (!tangents) {
+                std::vector<std::array<float, 3>> tangent_sums(imported.vertices.size());
+                std::vector<std::array<float, 3>> bitangent_sums(imported.vertices.size());
+                for (std::size_t index = 0; index < imported.indices.size(); index += 3) {
+                    const std::uint32_t ia = imported.indices[index], ib = imported.indices[index + 1], ic = imported.indices[index + 2];
+                    const auto& a = imported.vertices[ia]; const auto& b = imported.vertices[ib]; const auto& c = imported.vertices[ic];
+                    const float e1[3]{b.position[0]-a.position[0], b.position[1]-a.position[1], b.position[2]-a.position[2]};
+                    const float e2[3]{c.position[0]-a.position[0], c.position[1]-a.position[1], c.position[2]-a.position[2]};
+                    const float du1 = b.uv[0]-a.uv[0], dv1 = b.uv[1]-a.uv[1];
+                    const float du2 = c.uv[0]-a.uv[0], dv2 = c.uv[1]-a.uv[1];
+                    const float determinant = du1*dv2 - du2*dv1;
+                    if (std::abs(determinant) < 1e-8f) continue;
+                    const float inverse = 1.0f / determinant;
+                    const std::array<float,3> tangent{(e1[0]*dv2-e2[0]*dv1)*inverse,
+                        (e1[1]*dv2-e2[1]*dv1)*inverse, (e1[2]*dv2-e2[2]*dv1)*inverse};
+                    const std::array<float,3> bitangent{(e2[0]*du1-e1[0]*du2)*inverse,
+                        (e2[1]*du1-e1[1]*du2)*inverse, (e2[2]*du1-e1[2]*du2)*inverse};
+                    for (const std::uint32_t vertex_index : {ia, ib, ic}) for (unsigned axis = 0; axis < 3; ++axis) {
+                        tangent_sums[vertex_index][axis] += tangent[axis];
+                        bitangent_sums[vertex_index][axis] += bitangent[axis];
+                    }
+                }
+                for (std::size_t i = 0; i < imported.vertices.size(); ++i) {
+                    auto& vertex = imported.vertices[i];
+                    float projection = 0;
+                    for (unsigned axis = 0; axis < 3; ++axis) projection += vertex.normal[axis] * tangent_sums[i][axis];
+                    float length = 0;
+                    for (unsigned axis = 0; axis < 3; ++axis) {
+                        vertex.tangent[axis] = tangent_sums[i][axis] - vertex.normal[axis] * projection;
+                        length += vertex.tangent[axis] * vertex.tangent[axis];
+                    }
+                    length = std::sqrt(length);
+                    if (length < 1e-8f) {
+                        const float fallback[3]{std::abs(vertex.normal[0]) < 0.9f ? 1.0f : 0.0f,
+                            std::abs(vertex.normal[0]) < 0.9f ? 0.0f : 1.0f, 0.0f};
+                        float fallback_dot = 0;
+                        for (unsigned axis = 0; axis < 3; ++axis) fallback_dot += fallback[axis] * vertex.normal[axis];
+                        for (unsigned axis = 0; axis < 3; ++axis) vertex.tangent[axis] = fallback[axis] - fallback_dot * vertex.normal[axis];
+                        length = std::sqrt(vertex.tangent[0]*vertex.tangent[0] + vertex.tangent[1]*vertex.tangent[1] + vertex.tangent[2]*vertex.tangent[2]);
+                        if (length < 1e-8f) { vertex.tangent[0] = 1; vertex.tangent[1] = 0; vertex.tangent[2] = 0; }
+                        else for (unsigned axis = 0; axis < 3; ++axis) vertex.tangent[axis] /= length;
+                    } else for (unsigned axis = 0; axis < 3; ++axis) vertex.tangent[axis] /= length;
+                    const float cross_x = vertex.normal[1]*vertex.tangent[2] - vertex.normal[2]*vertex.tangent[1];
+                    const float cross_y = vertex.normal[2]*vertex.tangent[0] - vertex.normal[0]*vertex.tangent[2];
+                    const float cross_z = vertex.normal[0]*vertex.tangent[1] - vertex.normal[1]*vertex.tangent[0];
+                    const float orientation = cross_x*bitangent_sums[i][0] + cross_y*bitangent_sums[i][1] + cross_z*bitangent_sums[i][2];
+                    vertex.tangent[3] = orientation < 0 ? -1.0f : 1.0f;
                 }
             }
             if (primitive.material) {
@@ -615,7 +676,10 @@ bool MaterialDefinition::load(const std::filesystem::path& path, MaterialDefinit
 }
 
 AssetPipeline::AssetPipeline(std::filesystem::path project_root)
-    : project_root_(std::move(project_root)), worker_([this](const std::stop_token stop) { worker_loop(stop); }) {}
+    : project_root_(std::move(project_root)), registry_index_path_(project_root_ / L".together" / L"asset_registry.json"),
+      worker_([this](const std::stop_token stop) { worker_loop(stop); }) {
+    restore_registry_index();
+}
 
 AssetPipeline::~AssetPipeline() {
     worker_.request_stop();
@@ -649,6 +713,17 @@ AssetImportResult AssetPipeline::import_file(const std::filesystem::path& path, 
     const std::string id = std::string(asset_type_name(type)) + ":" + content_hash;
     AssetMetadata existing;
     if (registry_.find_by_id(id, existing)) {
+        if (!restoring_registry_) {
+            const auto absolute = std::filesystem::absolute(path);
+            const auto found = std::find_if(registry_records_.begin(), registry_records_.end(), [&](const auto& record) { return record.first == id; });
+            if (found == registry_records_.end()) registry_records_.emplace_back(id, absolute);
+            else found->second = absolute;
+            std::string persistence_error;
+            if (!save_registry_index(persistence_error)) {
+                persistence_errors_.push_back(persistence_error);
+                return {existing, registry_.payload(existing.handle), true, {}, std::move(persistence_error)};
+            }
+        }
         return {existing, registry_.payload(existing.handle), true, {}};
     }
     {
@@ -709,7 +784,99 @@ AssetImportResult AssetPipeline::import_file(const std::filesystem::path& path, 
         }
         cache_.insert_or_assign(id, shared);
     }
-    return registry_.register_asset(std::move(metadata), shared);
+    auto registered = registry_.register_asset(std::move(metadata), shared);
+    if (registered && !restoring_registry_) {
+        registry_records_.emplace_back(id, registered.metadata.source_path);
+        std::string persistence_error;
+        if (!save_registry_index(persistence_error)) {
+            persistence_errors_.push_back(persistence_error);
+            registered.persistence_error = std::move(persistence_error);
+        }
+    }
+    return registered;
+}
+
+bool AssetPipeline::save_registry_index(std::string& error) {
+    try {
+        std::filesystem::create_directories(registry_index_path_.parent_path());
+        nlohmann::json document;
+        document["format"] = "TogetherEngineAssetRegistry";
+        document["version"] = 1;
+        document["assets"] = nlohmann::json::array();
+        for (const auto& [id, path] : registry_records_) {
+            document["assets"].push_back({{"id", id}, {"sourcePath", utf8_path(path)}});
+        }
+        const auto temporary = registry_index_path_.wstring() + L".tmp";
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output) { error = "Cannot create the persistent asset registry index."; return false; }
+            const std::string encoded = document.dump(2);
+            output.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+            output.flush();
+            if (!output) { error = "Cannot write the persistent asset registry index."; return false; }
+        }
+        if (!MoveFileExW(temporary.c_str(), registry_index_path_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            error = "Cannot atomically replace the asset registry index (Windows error " + std::to_string(GetLastError()) + ").";
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            return false;
+        }
+        return true;
+    } catch (const std::exception& exception) {
+        error = std::string("Cannot save the persistent asset registry: ") + exception.what();
+        return false;
+    }
+}
+
+void AssetPipeline::restore_registry_index() {
+    std::error_code index_error;
+    if (!std::filesystem::exists(registry_index_path_, index_error)) {
+        if (index_error) persistence_errors_.push_back("Cannot inspect the persistent asset registry: " + index_error.message());
+        return;
+    }
+    try {
+        const auto index_size = std::filesystem::file_size(registry_index_path_, index_error);
+        if (index_error || index_size > 4ull * 1024 * 1024) {
+            persistence_errors_.push_back(index_error ? "Cannot read persistent asset registry size: " + index_error.message() :
+                "Persistent asset registry exceeds the 4 MiB safety limit.");
+            return;
+        }
+        std::ifstream input(registry_index_path_, std::ios::binary);
+        if (!input) { persistence_errors_.push_back("Cannot open the persistent asset registry index."); return; }
+        const auto document = nlohmann::json::parse(input, nullptr, false);
+        if (document.is_discarded() || !document.is_object() ||
+            document.value("format", std::string{}) != "TogetherEngineAssetRegistry" || document.value("version", 0) != 1 ||
+            !document.contains("assets") || !document["assets"].is_array()) {
+            persistence_errors_.push_back("Persistent asset registry has an invalid format or version.");
+            return;
+        }
+        if (document["assets"].size() > 10000) {
+            persistence_errors_.push_back("Persistent asset registry exceeds the 10,000-entry safety limit.");
+            return;
+        }
+        for (const auto& item : document["assets"]) {
+            if (!item.is_object() || !item.contains("id") || !item["id"].is_string() ||
+                !item.contains("sourcePath") || !item["sourcePath"].is_string()) {
+                persistence_errors_.push_back("Persistent asset registry contains a malformed entry.");
+                continue;
+            }
+            const std::string expected_id = item["id"].get<std::string>();
+            const std::filesystem::path source = std::filesystem::u8path(item["sourcePath"].get<std::string>());
+            registry_records_.emplace_back(expected_id, source);
+            if (!std::filesystem::is_regular_file(source)) {
+                persistence_errors_.push_back("Missing asset source: " + source.string());
+                continue;
+            }
+            restoring_registry_ = true;
+            const auto imported = import_file(source);
+            restoring_registry_ = false;
+            if (!imported) persistence_errors_.push_back("Could not restore " + source.string() + ": " + imported.error);
+            else if (imported.metadata.id != expected_id) persistence_errors_.push_back("Asset source changed since it was registered: " + source.string());
+        }
+    } catch (const std::exception& exception) {
+        restoring_registry_ = false;
+        persistence_errors_.push_back(std::string("Could not read the persistent asset registry: ") + exception.what());
+    }
 }
 
 std::future<AssetImportResult> AssetPipeline::import_async(std::filesystem::path path, const TextureQuality quality) {
@@ -748,12 +915,22 @@ std::uint64_t AssetPipeline::cached_bytes() const {
     return total;
 }
 
-bool AssetPipeline::remove_asset(const std::string& id) {
+bool AssetPipeline::remove_asset(const std::string& id, std::string* persistence_error) {
+    if (persistence_error) persistence_error->clear();
     {
         std::scoped_lock lock(cache_mutex_);
         cache_.erase(id);
     }
-    return registry_.remove(id);
+    const bool removed = registry_.remove(id);
+    if (removed) {
+        std::erase_if(registry_records_, [&](const auto& record) { return record.first == id; });
+        std::string save_error;
+        if (!save_registry_index(save_error)) {
+            persistence_errors_.push_back(save_error);
+            if (persistence_error) *persistence_error = std::move(save_error);
+        }
+    }
+    return removed;
 }
 
 } // namespace together::assets

@@ -25,6 +25,9 @@ struct Material {
     float roughness{0.72f};
     float metallic{};
     std::string base_color_texture_id;
+    std::string normal_texture_id;
+    std::string metallic_roughness_texture_id;
+    std::string occlusion_texture_id;
 };
 
 struct SceneObject {

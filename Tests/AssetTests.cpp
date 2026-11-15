@@ -65,12 +65,18 @@ int main() {
     material.name = "Test PBR";
     material.base_color = {0.2f, 0.4f, 0.6f, 1.0f};
     material.metallic = 0.35f;
+    material.textures[static_cast<std::size_t>(TextureSlot::Normal)] = "texture:normal";
+    material.textures[static_cast<std::size_t>(TextureSlot::Roughness)] = "texture:mr";
+    material.textures[static_cast<std::size_t>(TextureSlot::Occlusion)] = "texture:ao";
     std::string error;
     const auto material_path = directory / "test.twmat.json";
     ok &= check(material.save(material_path, error), "material saves as JSON");
     MaterialDefinition loaded;
     ok &= check(MaterialDefinition::load(material_path, loaded, error), "material reloads from JSON");
-    ok &= check(loaded.name == material.name && loaded.metallic == material.metallic, "material fields round trip");
+    ok &= check(loaded.name == material.name && loaded.metallic == material.metallic &&
+        loaded.textures[static_cast<std::size_t>(TextureSlot::Normal)] == "texture:normal" &&
+        loaded.textures[static_cast<std::size_t>(TextureSlot::Roughness)] == "texture:mr" &&
+        loaded.textures[static_cast<std::size_t>(TextureSlot::Occlusion)] == "texture:ao", "material factors and PBR texture slots round trip");
     loaded.roughness = 5.0f;
     ok &= check(!loaded.validate(error), "invalid material values are rejected");
 
@@ -103,6 +109,12 @@ int main() {
         "texture import generates its 1x1 mip level");
     const auto image_duplicate = pipeline.import_file(image_path, TextureQuality::Original);
     ok &= check(image_duplicate && image_duplicate.duplicate, "same texture import is deduplicated");
+    {
+        AssetPipeline restarted(directory);
+        AssetMetadata restored_metadata;
+        ok &= check(restarted.find(image.metadata.id, restored_metadata), "asset registry restores imported assets after pipeline restart");
+        ok &= check(restored_metadata.source_path == std::filesystem::absolute(image_path), "persistent registry restores the source path");
+    }
     const auto invalid_path = directory / "invalid.asset";
     { std::ofstream file(invalid_path); file << "not an asset"; }
     ok &= check(!pipeline.import_file(invalid_path), "unsupported asset types are rejected");
@@ -130,6 +142,18 @@ int main() {
     ok &= check(!pipeline.resolve({removed_handle.index, removed_handle.generation + 1}, resolved),
         "a fabricated handle for an empty slot is also rejected");
     ok &= check(pipeline.cached_bytes() > 0, "removing one asset preserves unrelated cached payloads");
+    {
+        AssetPipeline after_delete(directory);
+        ok &= check(!after_delete.find(imported_id, resolved), "removed asset remains absent after registry reload");
+    }
+
+    const auto broken_root = directory / "broken_registry";
+    std::filesystem::create_directories(broken_root / ".together");
+    { std::ofstream file(broken_root / ".together" / "asset_registry.json"); file << "{bad registry"; }
+    {
+        AssetPipeline broken_registry(broken_root);
+        ok &= check(!broken_registry.persistence_errors().empty(), "invalid persistent registry data is reported safely");
+    }
 
     std::error_code ec;
     std::filesystem::remove_all(directory, ec);

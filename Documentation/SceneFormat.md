@@ -22,7 +22,10 @@ Scene files use UTF-8 JSON and the `.tws.json` extension. Unknown fields may be 
         "roughness": 0.72,
         "metallic": 0,
         "emission": [0, 0, 0],
-        "baseColorTextureAssetId": ""
+        "baseColorTextureAssetId": "",
+        "normalTextureAssetId": "",
+        "metallicRoughnessTextureAssetId": "",
+        "occlusionTextureAssetId": ""
       },
       "modelAssetId": "",
       "materialAssetId": ""
@@ -31,4 +34,4 @@ Scene files use UTF-8 JSON and the `.tws.json` extension. Unknown fields may be 
 }
 ```
 
-IDs are positive JSON integers and unique within the scene. Position and Euler rotation are finite numbers within +/-1,000,000. Scale components must be positive and within the same bound. Base color, roughness, and metallic values are in [0, 1]; emission is in [0, 64]. Asset ID fields are optional for older version 1 files and are preserved as strings even if the referenced asset is missing. Saving validates first and writes to a temporary sibling file before replacing the destination, so an unsuccessful save does not truncate the previous scene.
+IDs are positive JSON integers and unique within the scene. Position and Euler rotation are finite numbers within +/-1,000,000. Scale components must be positive and within the same bound. Base color, roughness, and metallic values are in [0, 1]; emission is in [0, 64]. Asset ID fields are optional for older version 1 files and are preserved as strings even if the referenced asset is missing. The normal, metallic-roughness, and occlusion texture IDs are optional v1 extensions; when resolved, the D3D11 renderer samples them as linear data (metallic-roughness uses the glTF G roughness/B metallic channels; AO uses R). Saving validates first and writes to a temporary sibling file before replacing the destination, so an unsuccessful save does not truncate the previous scene.

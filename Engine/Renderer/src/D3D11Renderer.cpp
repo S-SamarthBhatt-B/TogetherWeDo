@@ -35,6 +35,7 @@ struct Vertex {
     DirectX::XMFLOAT3 position;
     DirectX::XMFLOAT3 normal;
     DirectX::XMFLOAT2 uv;
+    DirectX::XMFLOAT4 tangent{1,0,0,1};
 };
 
 struct alignas(16) SceneConstants {
@@ -45,6 +46,7 @@ struct alignas(16) SceneConstants {
     DirectX::XMFLOAT4 base_color;
     DirectX::XMFLOAT4 emission;
     DirectX::XMFLOAT4 material; // roughness, metallic, textured, padding
+    DirectX::XMFLOAT4 map_flags; // normal, metallic-roughness, occlusion, padding
     DirectX::XMFLOAT4 light_direction;
     DirectX::XMFLOAT4 fog_color_density;
 };
@@ -59,19 +61,24 @@ cbuffer SceneConstants : register(b0) {
     float4 baseColor;
     float4 emission;
     float4 material;
+    float4 mapFlags;
     float4 lightDirection;
     float4 fogColorDensity;
 };
 Texture2D surfaceTexture : register(t0);
+Texture2D normalTexture : register(t1);
+Texture2D metallicRoughnessTexture : register(t2);
+Texture2D occlusionTexture : register(t3);
 SamplerState surfaceSampler : register(s0);
-struct VSInput { float3 position : POSITION; float3 normal : NORMAL; float2 uv : TEXCOORD0; };
-struct VSOutput { float4 position : SV_POSITION; float3 worldPosition : POSITION0; float3 normal : NORMAL; float2 uv : TEXCOORD0; };
+struct VSInput { float3 position : POSITION; float3 normal : NORMAL; float2 uv : TEXCOORD0; float4 tangent : TANGENT; };
+struct VSOutput { float4 position : SV_POSITION; float3 worldPosition : POSITION0; float3 normal : NORMAL; float2 uv : TEXCOORD0; float4 tangent : TANGENT; };
 VSOutput VSMain(VSInput input) {
     VSOutput output;
     const float4 worldPosition = mul(float4(input.position, 1.0), world);
     output.position = mul(float4(input.position, 1.0), worldViewProjection);
     output.worldPosition = worldPosition.xyz;
     output.normal = normalize(mul(float4(input.normal, 0.0), normalTransform).xyz);
+    output.tangent = float4(normalize(mul(float4(input.tangent.xyz, 0.0), world).xyz), input.tangent.w);
     output.uv = input.uv;
     return output;
 }
@@ -91,9 +98,16 @@ float3 FresnelSchlick(float cosTheta, float3 f0) {
 float4 PSMain(VSOutput input) : SV_TARGET {
     float3 albedo = baseColor.rgb;
     if (material.z > 0.5) albedo *= surfaceTexture.Sample(surfaceSampler, input.uv).rgb;
-    const float roughness = clamp(material.x, 0.08, 1.0);
-    const float metallic = saturate(material.y);
-    const float3 n = normalize(input.normal);
+    const float4 metalRough = mapFlags.y > 0.5 ? metallicRoughnessTexture.Sample(surfaceSampler, input.uv) : float4(1,1,1,1);
+    const float roughness = clamp(material.x * metalRough.g, 0.08, 1.0);
+    const float metallic = saturate(material.y * metalRough.b);
+    float3 n = normalize(input.normal);
+    if (mapFlags.x > 0.5) {
+        const float3 tangent = normalize(input.tangent.xyz - n * dot(n, input.tangent.xyz));
+        const float3 bitangent = normalize(cross(n, tangent)) * input.tangent.w;
+        const float3 sampledNormal = normalTexture.Sample(surfaceSampler, input.uv).xyz * 2.0 - 1.0;
+        n = normalize(sampledNormal.x * tangent + sampledNormal.y * bitangent + sampledNormal.z * n);
+    }
     const float3 l = normalize(-lightDirection.xyz);
     const float3 v = normalize(cameraPosition.xyz - input.worldPosition);
     const float3 h = normalize(v + l);
@@ -106,7 +120,8 @@ float4 PSMain(VSOutput input) : SV_TARGET {
     const float3 specular = (d * g * f) / max(4.0 * nDotV * nDotL, 0.001);
     const float3 diffuse = (1.0 - f) * (1.0 - metallic) * albedo / 3.14159265;
     const float3 direct = (diffuse + specular) * nDotL * float3(3.0, 2.8, 2.5);
-    const float3 ambient = albedo * float3(0.14, 0.17, 0.13) * (1.0 - metallic);
+    const float occlusion = mapFlags.z > 0.5 ? occlusionTexture.Sample(surfaceSampler, input.uv).r : 1.0;
+    const float3 ambient = albedo * float3(0.14, 0.17, 0.13) * (1.0 - metallic) * occlusion;
     const float3 lit = direct + ambient + emission.rgb;
     const float distanceToCamera = distance(cameraPosition.xyz, input.worldPosition);
     const float fog = saturate(1.0 - exp(-fogColorDensity.a * distanceToCamera));
@@ -185,6 +200,9 @@ struct DrawObject {
     std::string_view model_asset_id{};
     bool material_override{};
     DirectX::XMFLOAT3 emission{};
+    std::string_view normal_texture{};
+    std::string_view metallic_roughness_texture{};
+    std::string_view occlusion_texture{};
 };
 
 struct GpuModelPrimitive {
@@ -416,10 +434,11 @@ struct D3D11Renderer::Impl {
         hr = device->CreatePixelShader(sky_ps_blob->GetBufferPointer(), sky_ps_blob->GetBufferSize(), nullptr, &sky_pixel_shader);
         if (FAILED(hr)) { log_hresult("CreatePixelShader(sky)", hr); return false; }
 
-        constexpr std::array<D3D11_INPUT_ELEMENT_DESC, 3> layout{{
+        constexpr std::array<D3D11_INPUT_ELEMENT_DESC, 4> layout{{
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(Vertex, position), D3D11_INPUT_PER_VERTEX_DATA, 0},
             {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(Vertex, normal), D3D11_INPUT_PER_VERTEX_DATA, 0},
             {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(Vertex, uv), D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TANGENT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Vertex, tangent), D3D11_INPUT_PER_VERTEX_DATA, 0},
         }};
         hr = device->CreateInputLayout(layout.data(), static_cast<UINT>(layout.size()),
             vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), &input_layout);
@@ -618,7 +637,8 @@ void D3D11Renderer::set_editor_scene(const std::span<const RenderObject> objects
                 DirectX::XMConvertToRadians(object.rotation_degrees.y), DirectX::XMConvertToRadians(object.rotation_degrees.z)) *
             DirectX::XMMatrixTranslation(object.position.x, object.position.y, object.position.z);
         impl_->editor_objects.push_back({impl_->cube, transform, object.base_color_texture_id, object.base_color,
-            object.roughness, object.metallic, object.model_asset_id, object.material_override, object.emission});
+            object.roughness, object.metallic, object.model_asset_id, object.material_override, object.emission,
+            object.normal_texture_id, object.metallic_roughness_texture_id, object.occlusion_texture_id});
         if (object.selected) {
             impl_->selected_position = object.position;
             impl_->editor_has_selection = true;
@@ -723,14 +743,16 @@ bool D3D11Renderer::register_model(const std::string_view asset_id,
             !std::all_of(primitive.vertices.begin(), primitive.vertices.end(), [](const ModelVertex& vertex) {
                 return std::isfinite(vertex.position.x) && std::isfinite(vertex.position.y) && std::isfinite(vertex.position.z) &&
                     std::isfinite(vertex.normal.x) && std::isfinite(vertex.normal.y) && std::isfinite(vertex.normal.z) &&
-                    std::isfinite(vertex.uv.x) && std::isfinite(vertex.uv.y);
+                    std::isfinite(vertex.uv.x) && std::isfinite(vertex.uv.y) &&
+                    std::isfinite(vertex.tangent.x) && std::isfinite(vertex.tangent.y) &&
+                    std::isfinite(vertex.tangent.z) && std::isfinite(vertex.tangent.w);
             })) {
             core::Logger::instance().write(core::LogLevel::Error, "Model registration rejected invalid or oversized triangle geometry.");
             return false;
         }
         std::vector<Vertex> vertices;
         vertices.reserve(primitive.vertices.size());
-        for (const ModelVertex& vertex : primitive.vertices) vertices.push_back({vertex.position, vertex.normal, vertex.uv});
+        for (const ModelVertex& vertex : primitive.vertices) vertices.push_back({vertex.position, vertex.normal, vertex.uv, vertex.tangent});
         D3D11_BUFFER_DESC vertex_desc{};
         vertex_desc.ByteWidth = static_cast<UINT>(vertices.size() * sizeof(Vertex));
         vertex_desc.Usage = D3D11_USAGE_IMMUTABLE;
@@ -779,7 +801,7 @@ bool D3D11Renderer::register_texture_rgba8_mipped(const std::string_view name,
     desc.Height = mip_levels.front().height;
     desc.MipLevels = static_cast<UINT>(mip_levels.size());
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_IMMUTABLE;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -798,22 +820,32 @@ bool D3D11Renderer::register_texture_rgba8_mipped(const std::string_view name,
     ComPtr<ID3D11Texture2D> texture;
     HRESULT hr = impl_->device->CreateTexture2D(&desc, initial_data.data(), &texture);
     if (FAILED(hr)) { log_hresult("CreateTexture2D(mipped asset)", hr); return false; }
-    ComPtr<ID3D11ShaderResourceView> view;
-    hr = impl_->device->CreateShaderResourceView(texture.Get(), nullptr, &view);
-    if (FAILED(hr)) { log_hresult("CreateShaderResourceView(mipped asset)", hr); return false; }
+    D3D11_SHADER_RESOURCE_VIEW_DESC view_desc{};
+    view_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    view_desc.Texture2D.MostDetailedMip = 0;
+    view_desc.Texture2D.MipLevels = static_cast<UINT>(mip_levels.size());
+    ComPtr<ID3D11ShaderResourceView> srgb_view;
+    view_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    hr = impl_->device->CreateShaderResourceView(texture.Get(), &view_desc, &srgb_view);
+    if (FAILED(hr)) { log_hresult("CreateShaderResourceView(mipped asset sRGB)", hr); return false; }
+    ComPtr<ID3D11ShaderResourceView> linear_view;
+    view_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    hr = impl_->device->CreateShaderResourceView(texture.Get(), &view_desc, &linear_view);
+    if (FAILED(hr)) { log_hresult("CreateShaderResourceView(mipped asset linear)", hr); return false; }
     {
         std::unique_lock lock(impl_->textures_mutex);
-        impl_->textures.insert_or_assign(std::string(name), std::move(view));
+        impl_->textures.insert_or_assign(std::string(name), std::move(srgb_view));
+        impl_->textures.insert_or_assign(std::string(name) + "#linear", std::move(linear_view));
     }
     return true;
 }
 
 void D3D11Renderer::release_asset(const std::string_view asset_id) {
     if (impl_->context) {
-        ID3D11ShaderResourceView* null_view = nullptr;
+        std::array<ID3D11ShaderResourceView*, 4> null_views{};
         ID3D11Buffer* null_buffer = nullptr;
         const UINT zero = 0;
-        impl_->context->PSSetShaderResources(0, 1, &null_view);
+        impl_->context->PSSetShaderResources(0, static_cast<UINT>(null_views.size()), null_views.data());
         impl_->context->IASetVertexBuffers(0, 1, &null_buffer, &zero, &zero);
         impl_->context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
     }
@@ -824,6 +856,7 @@ void D3D11Renderer::release_asset(const std::string_view asset_id) {
     {
         std::unique_lock lock(impl_->textures_mutex);
         impl_->textures.erase(std::string(asset_id));
+        impl_->textures.erase(std::string(asset_id) + "#linear");
     }
 }
 
@@ -891,20 +924,29 @@ void D3D11Renderer::render(const float elapsed_seconds, const float delta_second
         const float roughness = model_primitive && !object.material_override ? model_primitive->roughness : object.roughness;
         const float metallic = model_primitive && !object.material_override ? model_primitive->metallic : object.metallic;
         data.material = {roughness, metallic, 0.0f, 0};
+        data.map_flags = {0, 0, 0, 0};
         data.light_direction = {-0.42f, -1.0f, 0.28f, 0};
         data.fog_color_density = {0.61f, 0.64f, 0.52f, 0.018f};
-        ID3D11ShaderResourceView* texture = nullptr;
+        std::array<ID3D11ShaderResourceView*, 4> material_textures{};
         std::shared_lock texture_lock(impl_->textures_mutex, std::defer_lock);
-        if (!object.texture.empty()) {
+        if (!object.texture.empty() || !object.normal_texture.empty() ||
+            !object.metallic_roughness_texture.empty() || !object.occlusion_texture.empty()) {
             texture_lock.lock();
-            const auto found = impl_->textures.find(object.texture);
-            if (found != impl_->textures.end()) {
-                texture = found->second.Get();
-                data.material.z = 1.0f;
-            }
+            const auto find_texture = [&](const std::string_view id) -> ID3D11ShaderResourceView* {
+                if (id.empty()) return nullptr;
+                const auto found = impl_->textures.find(id);
+                return found == impl_->textures.end() ? nullptr : found->second.Get();
+            };
+            material_textures[0] = find_texture(object.texture);
+            material_textures[1] = find_texture(object.normal_texture);
+            material_textures[2] = find_texture(object.metallic_roughness_texture);
+            material_textures[3] = find_texture(object.occlusion_texture);
+            data.material.z = material_textures[0] ? 1.0f : 0.0f;
+            data.map_flags = {material_textures[1] ? 1.0f : 0.0f, material_textures[2] ? 1.0f : 0.0f,
+                material_textures[3] ? 1.0f : 0.0f, 0.0f};
         }
         impl_->context->UpdateSubresource(impl_->constants.Get(), 0, nullptr, &data, 0, 0);
-        impl_->context->PSSetShaderResources(0, 1, &texture);
+        impl_->context->PSSetShaderResources(0, static_cast<UINT>(material_textures.size()), material_textures.data());
         if (texture_lock.owns_lock()) texture_lock.unlock();
         if (model_primitive) {
             const UINT model_stride = static_cast<UINT>(sizeof(Vertex));
