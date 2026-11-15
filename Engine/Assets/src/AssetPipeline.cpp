@@ -9,13 +9,14 @@
 #include <cmath>
 #include <cctype>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <span>
 #include <type_traits>
-#include <nlohmann/json.hpp>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 
 #include "cgltf.h"
@@ -515,6 +516,89 @@ std::size_t payload_size(const AssetPayload& payload) {
     }, payload);
 }
 
+bool path_is_within(const std::filesystem::path& parent, const std::filesystem::path& candidate) {
+    const auto parent_normal = parent.lexically_normal();
+    const auto candidate_normal = candidate.lexically_normal();
+    auto parent_it = parent_normal.begin();
+    const auto parent_end = parent_normal.end();
+    auto candidate_it = candidate_normal.begin();
+    const auto candidate_end = candidate_normal.end();
+    for (; parent_it != parent_end; ++parent_it, ++candidate_it) {
+        if (candidate_it == candidate_end) return false;
+        const std::wstring a = parent_it->native();
+        const std::wstring b = candidate_it->native();
+        if (CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()), TRUE) != CSTR_EQUAL)
+            return false;
+    }
+    return candidate_it != candidate_end;
+}
+
+bool decode_uri_path(const std::string_view uri, std::filesystem::path& path, std::string& error) {
+    if (uri.empty() || uri.starts_with("data:")) { path.clear(); return true; }
+    if (uri.find("://") != std::string_view::npos || uri.starts_with("file:") || uri.find_first_of("?#") != std::string_view::npos) {
+        error = "External glTF URI schemes and query/fragment suffixes are unsupported in portable asset packages.";
+        return false;
+    }
+    std::string decoded;
+    decoded.reserve(uri.size());
+    const auto hex = [](const char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < uri.size(); ++i) {
+        if (uri[i] == '%') {
+            if (i + 2 >= uri.size() || hex(uri[i+1]) < 0 || hex(uri[i+2]) < 0) {
+                error = "glTF external resource URI contains invalid percent encoding.";
+                return false;
+            }
+            decoded.push_back(static_cast<char>((hex(uri[i+1]) << 4) | hex(uri[i+2])));
+            i += 2;
+        } else decoded.push_back(uri[i] == '/' ? '\\' : uri[i]);
+    }
+    path = std::filesystem::u8path(decoded);
+    if (path.is_absolute() || path.has_root_name() || path.has_root_directory()) {
+        error = "Absolute glTF resource paths cannot be packaged portably.";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+bool collect_gltf_external_uris(const std::filesystem::path& path, std::vector<std::filesystem::path>& uris, std::string& error) {
+    cgltf_options options{};
+    cgltf_data* parsed{};
+    const std::string path_utf8 = utf8_path(path);
+    const cgltf_result result = cgltf_parse_file(&options, path_utf8.c_str(), &parsed);
+    if (result != cgltf_result_success || !parsed) { error = "Could not inspect glTF dependencies for portable import."; return false; }
+    std::unique_ptr<cgltf_data, decltype(&cgltf_free)> data(parsed, cgltf_free);
+    std::unordered_set<std::wstring> unique;
+    const auto add = [&](const char* uri) {
+        if (!uri || !*uri) return true;
+        std::filesystem::path relative;
+        if (!decode_uri_path(uri, relative, error)) return false;
+        if (relative.empty()) return true;
+        const auto normalized = relative.lexically_normal();
+        if (normalized == L"." || normalized.empty()) return true;
+        if (unique.insert(normalized.native()).second) uris.push_back(normalized);
+        return true;
+    };
+    for (cgltf_size i = 0; i < data->buffers_count; ++i) if (!add(data->buffers[i].uri)) return false;
+    for (cgltf_size i = 0; i < data->images_count; ++i) if (!add(data->images[i].uri)) return false;
+    return true;
+}
+
+bool valid_asset_id(const std::string& id) {
+    const auto separator = id.find(':');
+    if (separator == std::string::npos || id.size() - separator - 1 != 64) return false;
+    const std::string type = id.substr(0, separator);
+    if (type != "texture" && type != "model" && type != "audio" && type != "material") return false;
+    return std::all_of(id.begin() + static_cast<std::ptrdiff_t>(separator + 1), id.end(), [](const unsigned char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    });
+}
+
 } // namespace
 
 const char* asset_type_name(const AssetType type) noexcept {
@@ -569,6 +653,16 @@ bool AssetRegistry::find_by_id(const std::string& id, AssetMetadata& output) con
     const auto found = by_id_.find(id);
     if (found == by_id_.end()) return false;
     output = slots_[found->second].metadata;
+    return true;
+}
+
+bool AssetRegistry::update_source(const std::string& id, std::filesystem::path source_path, std::string name) {
+    std::scoped_lock lock(mutex_);
+    const auto found = by_id_.find(id);
+    if (found == by_id_.end()) return false;
+    auto& metadata = slots_[found->second].metadata;
+    metadata.source_path = std::move(source_path);
+    metadata.name = std::move(name);
     return true;
 }
 
@@ -676,20 +770,133 @@ bool MaterialDefinition::load(const std::filesystem::path& path, MaterialDefinit
 }
 
 AssetPipeline::AssetPipeline(std::filesystem::path project_root)
-    : project_root_(std::move(project_root)), registry_index_path_(project_root_ / L".together" / L"asset_registry.json"),
+    : project_root_(std::filesystem::absolute(std::move(project_root)).lexically_normal()),
+      registry_index_path_(project_root_ / L".together" / L"asset_registry.json"),
       worker_([this](const std::stop_token stop) { worker_loop(stop); }) {
+    std::error_code root_error;
+    const auto canonical_root = std::filesystem::weakly_canonical(project_root_, root_error);
+    if (!root_error) project_root_ = canonical_root;
+    registry_index_path_ = project_root_ / L".together" / L"asset_registry.json";
     restore_registry_index();
 }
 
 AssetPipeline::~AssetPipeline() {
     worker_.request_stop();
     queue_ready_.notify_all();
+    if (worker_.joinable()) worker_.join();
+}
+
+bool AssetPipeline::make_relative_asset_path(const std::filesystem::path& absolute,
+    std::filesystem::path& relative, std::string& error) const {
+    std::error_code ec;
+    const auto candidate = std::filesystem::weakly_canonical(absolute, ec);
+    if (ec) { error = "Cannot canonicalize asset source path: " + ec.message(); return false; }
+    const auto root = std::filesystem::weakly_canonical(project_root_, ec);
+    if (ec || !path_is_within(root, candidate)) {
+        error = "Asset source must be stored inside the current project asset directory.";
+        return false;
+    }
+    relative = candidate.lexically_relative(root);
+    if (relative.empty() || relative.is_absolute() || relative.has_root_name()) {
+        error = "Could not produce a project-relative asset path.";
+        return false;
+    }
+    for (const auto& component : relative) if (component == L"..") {
+        error = "Asset source path escapes the project root.";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+bool AssetPipeline::resolve_relative_asset_path(const std::filesystem::path& relative,
+    std::filesystem::path& absolute, std::string& error) const {
+    if (relative.empty() || relative.is_absolute() || relative.has_root_name() || relative.has_root_directory()) {
+        error = "Registry asset path must be a non-empty project-relative path.";
+        return false;
+    }
+    for (const auto& component : relative) if (component == L"..") {
+        error = "Registry asset path attempts to leave the project root.";
+        return false;
+    }
+    std::error_code ec;
+    const auto root = std::filesystem::weakly_canonical(project_root_, ec);
+    if (ec) { error = "Cannot resolve project root: " + ec.message(); return false; }
+    const auto candidate = std::filesystem::weakly_canonical(root / relative, ec);
+    if (ec || !path_is_within(root, candidate)) {
+        error = "Registry asset path resolves outside the project root.";
+        return false;
+    }
+    absolute = candidate;
+    error.clear();
+    return true;
+}
+
+std::filesystem::path AssetPipeline::stage_asset_source(const std::filesystem::path& source,
+    const AssetType type, const std::string& content_hash, std::string& error) const {
+    std::error_code ec;
+    const auto absolute_source = std::filesystem::weakly_canonical(source, ec);
+    if (ec || !std::filesystem::is_regular_file(absolute_source, ec) || ec) {
+        error = "Asset source disappeared before it could be copied into the project.";
+        return {};
+    }
+    const auto package = project_root_ / L"Assets" / std::filesystem::u8path(asset_type_name(type)) / std::filesystem::u8path(content_hash);
+    const auto existing_parent = absolute_source.parent_path();
+    const auto managed_root = project_root_ / L"Assets" / std::filesystem::u8path(asset_type_name(type)) / std::filesystem::u8path(content_hash);
+    if (path_is_within(managed_root, absolute_source)) { error.clear(); return absolute_source; }
+
+    std::filesystem::path destination = package / absolute_source.filename();
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> dependencies;
+    if (type == AssetType::Model && (lowercase_extension(source) == ".gltf" || lowercase_extension(source) == ".glb")) {
+        std::vector<std::filesystem::path> uris;
+        if (!collect_gltf_external_uris(absolute_source, uris, error)) return {};
+        unsigned nesting = 0;
+        for (const auto& uri : uris) {
+            int depth = 0;
+            for (const auto& component : uri) {
+                if (component == L"..") { --depth; nesting = (std::max)(nesting, static_cast<unsigned>(-depth)); }
+                else if (component != L".") ++depth;
+            }
+        }
+        auto model_parent = package;
+        for (unsigned i = 0; i < nesting; ++i) model_parent /= L"_relative";
+        destination = model_parent / absolute_source.filename();
+        for (const auto& uri : uris) {
+            const auto source_dependency = (existing_parent / uri).lexically_normal();
+            if (!std::filesystem::is_regular_file(source_dependency, ec) || ec) {
+                error = "glTF external resource is missing: " + source_dependency.string();
+                return {};
+            }
+            const auto destination_dependency = (model_parent / uri).lexically_normal();
+            if (!path_is_within(package, destination_dependency)) {
+                error = "glTF external resource cannot be represented safely inside the project asset package.";
+                return {};
+            }
+            dependencies.emplace_back(source_dependency, destination_dependency);
+        }
+    }
+    std::filesystem::create_directories(destination.parent_path(), ec);
+    if (ec) { error = "Cannot create project asset folder: " + ec.message(); return {}; }
+    std::filesystem::copy_file(absolute_source, destination, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) { error = "Cannot copy asset into project: " + ec.message(); return {}; }
+    for (const auto& [source_dependency, destination_dependency] : dependencies) {
+        std::filesystem::create_directories(destination_dependency.parent_path(), ec);
+        if (ec) { error = "Cannot create glTF dependency folder: " + ec.message(); return {}; }
+        std::filesystem::copy_file(source_dependency, destination_dependency, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) { error = "Cannot package glTF dependency: " + ec.message(); return {}; }
+    }
+    error.clear();
+    return destination;
 }
 
 AssetImportResult AssetPipeline::import_file(const std::filesystem::path& path, const TextureQuality quality) {
+    std::scoped_lock operation_lock(operation_mutex_);
     AssetImportResult failed;
     if (path.empty()) { failed.error = "Asset path is empty."; return failed; }
-    const std::string ext = lowercase_extension(path);
+    std::error_code absolute_error;
+    const std::filesystem::path absolute_path = std::filesystem::absolute(path, absolute_error).lexically_normal();
+    if (absolute_error) { failed.error = "Cannot resolve asset source path: " + absolute_error.message(); return failed; }
+    const std::string ext = lowercase_extension(absolute_path);
     AssetType type{};
     std::uint64_t limit{};
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga") { type = AssetType::Texture; limit = kMaxImageFileBytes; }
@@ -701,49 +908,47 @@ AssetImportResult AssetPipeline::import_file(const std::filesystem::path& path, 
     std::vector<std::uint8_t> bytes;
     if (type == AssetType::Model) {
         std::error_code ec;
-        const auto file_size = std::filesystem::file_size(path, ec);
+        const auto file_size = std::filesystem::file_size(absolute_path, ec);
         if (ec || file_size == 0 || file_size > limit) { failed.error = "Model file is missing, empty, or exceeds 128 MiB."; return failed; }
-    } else if (!read_file(path, limit, bytes, failed.error)) return failed;
+    } else if (!read_file(absolute_path, limit, bytes, failed.error)) return failed;
 
     std::string content_hash;
     if (type == AssetType::Model) {
-        if (!read_file(path, limit, bytes, failed.error)) return failed;
+        if (!read_file(absolute_path, limit, bytes, failed.error)) return failed;
     }
     if (!sha256(bytes, content_hash, failed.error)) return failed;
     const std::string id = std::string(asset_type_name(type)) + ":" + content_hash;
+    const auto remember_asset = [&](const std::filesystem::path& source_path, std::string& persistence_error) {
+        std::filesystem::path relative;
+        std::string relative_error;
+        if (!make_relative_asset_path(source_path, relative, relative_error)) {
+            persistence_error = std::move(relative_error);
+            return false;
+        }
+        const auto found = std::find_if(registry_records_.begin(), registry_records_.end(), [&](const auto& record) { return record.first == id; });
+        if (found == registry_records_.end()) registry_records_.emplace_back(id, relative);
+        else found->second = relative;
+        if (restoring_registry_) return true;
+        if (!save_registry_index(persistence_error)) {
+            persistence_errors_.push_back(persistence_error);
+            return false;
+        }
+        return true;
+    };
     AssetMetadata existing;
     if (registry_.find_by_id(id, existing)) {
-        if (!restoring_registry_) {
-            const auto absolute = std::filesystem::absolute(path);
-            const auto found = std::find_if(registry_records_.begin(), registry_records_.end(), [&](const auto& record) { return record.first == id; });
-            if (found == registry_records_.end()) registry_records_.emplace_back(id, absolute);
-            else found->second = absolute;
-            std::string persistence_error;
-            if (!save_registry_index(persistence_error)) {
-                persistence_errors_.push_back(persistence_error);
-                return {existing, registry_.payload(existing.handle), true, {}, std::move(persistence_error)};
-            }
-        }
-        return {existing, registry_.payload(existing.handle), true, {}};
-    }
-    {
-        std::scoped_lock lock(cache_mutex_);
-        const auto cached = cache_.find(id);
-        if (cached != cache_.end()) {
-            AssetMetadata metadata;
-            metadata.type = type; metadata.id = id; metadata.content_hash = content_hash;
-            metadata.name = path.stem().string(); metadata.source_path = path; metadata.file_size = bytes.size();
-            return registry_.register_asset(std::move(metadata), cached->second);
-        }
+        std::string persistence_error;
+        const bool persisted = remember_asset(existing.source_path, persistence_error);
+        return {existing, registry_.payload(existing.handle), true, {}, persisted ? std::string{} : std::move(persistence_error)};
     }
 
     AssetMetadata metadata;
     metadata.type = type;
     metadata.id = id;
     metadata.content_hash = content_hash;
-    metadata.name = type == AssetType::Material && path.filename().string().ends_with(".twmat.json")
-        ? path.filename().string().substr(0, path.filename().string().size() - 11) : path.stem().string();
-    metadata.source_path = std::filesystem::absolute(path);
+    metadata.name = type == AssetType::Material && absolute_path.filename().string().ends_with(".twmat.json")
+        ? absolute_path.filename().string().substr(0, absolute_path.filename().string().size() - 11) : absolute_path.stem().string();
+    metadata.source_path = absolute_path;
     metadata.file_size = bytes.size();
     std::shared_ptr<AssetPayload> payload_value;
     if (type == AssetType::Texture) {
@@ -752,7 +957,7 @@ AssetImportResult AssetPipeline::import_file(const std::filesystem::path& path, 
         payload_value = std::make_shared<AssetPayload>(std::move(texture));
     } else if (type == AssetType::Model) {
         ModelData model;
-        if (!import_model(path, model, metadata, failed.error)) return failed;
+        if (!import_model(absolute_path, model, metadata, failed.error)) return failed;
         payload_value = std::make_shared<AssetPayload>(std::move(model));
     } else if (type == AssetType::Audio) {
         AudioData audio;
@@ -763,12 +968,14 @@ AssetImportResult AssetPipeline::import_file(const std::filesystem::path& path, 
         payload_value = std::make_shared<AssetPayload>(std::move(audio));
     } else {
         MaterialDefinition material;
-        if (!MaterialDefinition::load(path, material, failed.error)) return failed;
+        if (!MaterialDefinition::load(absolute_path, material, failed.error)) return failed;
         if (material.id.empty()) material.id = id;
         metadata.format = "Together Engine Material v1";
         metadata.decoded_bytes = sizeof(MaterialDefinition);
         payload_value = std::make_shared<AssetPayload>(std::move(material));
     }
+    metadata.source_path = stage_asset_source(absolute_path, type, content_hash, failed.error);
+    if (metadata.source_path.empty()) return failed;
     const std::shared_ptr<const AssetPayload> shared = payload_value;
     {
         std::scoped_lock lock(cache_mutex_);
@@ -785,13 +992,9 @@ AssetImportResult AssetPipeline::import_file(const std::filesystem::path& path, 
         cache_.insert_or_assign(id, shared);
     }
     auto registered = registry_.register_asset(std::move(metadata), shared);
-    if (registered && !restoring_registry_) {
-        registry_records_.emplace_back(id, registered.metadata.source_path);
+    if (registered) {
         std::string persistence_error;
-        if (!save_registry_index(persistence_error)) {
-            persistence_errors_.push_back(persistence_error);
-            registered.persistence_error = std::move(persistence_error);
-        }
+        if (!remember_asset(registered.metadata.source_path, persistence_error)) registered.persistence_error = std::move(persistence_error);
     }
     return registered;
 }
@@ -801,7 +1004,7 @@ bool AssetPipeline::save_registry_index(std::string& error) {
         std::filesystem::create_directories(registry_index_path_.parent_path());
         nlohmann::json document;
         document["format"] = "TogetherEngineAssetRegistry";
-        document["version"] = 1;
+        document["version"] = 2;
         document["assets"] = nlohmann::json::array();
         for (const auto& [id, path] : registry_records_) {
             document["assets"].push_back({{"id", id}, {"sourcePath", utf8_path(path)}});
@@ -844,8 +1047,9 @@ void AssetPipeline::restore_registry_index() {
         std::ifstream input(registry_index_path_, std::ios::binary);
         if (!input) { persistence_errors_.push_back("Cannot open the persistent asset registry index."); return; }
         const auto document = nlohmann::json::parse(input, nullptr, false);
+        const int version = document.is_object() ? document.value("version", 0) : 0;
         if (document.is_discarded() || !document.is_object() ||
-            document.value("format", std::string{}) != "TogetherEngineAssetRegistry" || document.value("version", 0) != 1 ||
+            document.value("format", std::string{}) != "TogetherEngineAssetRegistry" || (version != 1 && version != 2) ||
             !document.contains("assets") || !document["assets"].is_array()) {
             persistence_errors_.push_back("Persistent asset registry has an invalid format or version.");
             return;
@@ -854,6 +1058,9 @@ void AssetPipeline::restore_registry_index() {
             persistence_errors_.push_back("Persistent asset registry exceeds the 10,000-entry safety limit.");
             return;
         }
+        std::unordered_set<std::string> seen;
+        std::vector<std::pair<std::string, std::filesystem::path>> missing;
+        restoring_registry_ = true;
         for (const auto& item : document["assets"]) {
             if (!item.is_object() || !item.contains("id") || !item["id"].is_string() ||
                 !item.contains("sourcePath") || !item["sourcePath"].is_string()) {
@@ -861,22 +1068,77 @@ void AssetPipeline::restore_registry_index() {
                 continue;
             }
             const std::string expected_id = item["id"].get<std::string>();
-            const std::filesystem::path source = std::filesystem::u8path(item["sourcePath"].get<std::string>());
-            registry_records_.emplace_back(expected_id, source);
-            if (!std::filesystem::is_regular_file(source)) {
-                persistence_errors_.push_back("Missing asset source: " + source.string());
+            if (!valid_asset_id(expected_id)) { persistence_errors_.push_back("Persistent asset registry contains an invalid asset ID."); continue; }
+            if (!seen.insert(expected_id).second) { persistence_errors_.push_back("Persistent asset registry contains a duplicate ID: " + expected_id); continue; }
+            const std::filesystem::path stored_path = std::filesystem::u8path(item["sourcePath"].get<std::string>());
+            std::filesystem::path source;
+            std::string path_error;
+            if (version == 1 && stored_path.is_absolute()) {
+                std::error_code ec;
+                if (!std::filesystem::is_regular_file(stored_path, ec) || ec) {
+                    persistence_errors_.push_back("Legacy absolute asset source is missing and cannot be relocated automatically: " + stored_path.string());
+                    continue;
+                }
+                source = stored_path;
+            } else if (!resolve_relative_asset_path(stored_path, source, path_error)) {
+                persistence_errors_.push_back("Invalid asset registry path: " + path_error);
                 continue;
             }
-            restoring_registry_ = true;
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(source, ec) || ec) {
+                persistence_errors_.push_back("Missing asset source: " + source.string());
+                if (version == 2) missing.emplace_back(expected_id, stored_path);
+                continue;
+            }
             const auto imported = import_file(source);
-            restoring_registry_ = false;
-            if (!imported) persistence_errors_.push_back("Could not restore " + source.string() + ": " + imported.error);
-            else if (imported.metadata.id != expected_id) persistence_errors_.push_back("Asset source changed since it was registered: " + source.string());
+            if (!imported) {
+                persistence_errors_.push_back("Could not restore " + source.string() + ": " + imported.error);
+                if (version == 2) missing.emplace_back(expected_id, stored_path);
+            }
+            else if (imported.metadata.id != expected_id) {
+                persistence_errors_.push_back("Asset source changed since registration; stale entry was discarded: " + source.string());
+                (void)remove_asset(imported.metadata.id);
+            }
         }
+        restoring_registry_ = false;
+        registry_records_.insert(registry_records_.end(), missing.begin(), missing.end());
+        std::string save_error;
+        // Rewrite migrated paths and any source paths normalized during restoration.
+        if (!save_registry_index(save_error)) persistence_errors_.push_back("Could not persist validated asset registry: " + save_error);
     } catch (const std::exception& exception) {
         restoring_registry_ = false;
         persistence_errors_.push_back(std::string("Could not read the persistent asset registry: ") + exception.what());
     }
+}
+
+std::vector<std::string> AssetPipeline::restore_missing_assets() {
+    std::scoped_lock operation_lock(operation_mutex_);
+    std::vector<std::string> messages;
+    const auto records_to_check = registry_records_;
+    for (const auto& [expected_id, relative] : records_to_check) {
+        AssetMetadata restored;
+        if (registry_.find_by_id(expected_id, restored)) continue;
+        std::filesystem::path source;
+        std::string error;
+        if (!resolve_relative_asset_path(relative, source, error)) { messages.push_back(error); continue; }
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(source, ec) || ec) { messages.push_back("Still missing: " + source.string()); continue; }
+        restoring_registry_ = true;
+        auto result = import_file(source);
+        restoring_registry_ = false;
+        if (!result) { messages.push_back("Could not restore " + source.string() + ": " + result.error); continue; }
+        if (result.metadata.id != expected_id) {
+            (void)remove_asset(result.metadata.id);
+            const auto found = std::find_if(registry_records_.begin(), registry_records_.end(), [&](const auto& record) { return record.first == result.metadata.id; });
+            if (found != registry_records_.end()) registry_records_.erase(found);
+            messages.push_back("Source content no longer matches registered ID: " + source.string());
+            continue;
+        }
+        messages.push_back("Restored asset: " + source.string());
+    }
+    std::string save_error;
+    if (!save_registry_index(save_error)) messages.push_back("Could not save registry after recovery: " + save_error);
+    return messages;
 }
 
 std::future<AssetImportResult> AssetPipeline::import_async(std::filesystem::path path, const TextureQuality quality) {
@@ -915,22 +1177,94 @@ std::uint64_t AssetPipeline::cached_bytes() const {
     return total;
 }
 
-bool AssetPipeline::remove_asset(const std::string& id, std::string* persistence_error) {
+bool AssetPipeline::rename_asset(const std::string& id, const std::filesystem::path& new_filename, std::string& error) {
+    std::scoped_lock operation_lock(operation_mutex_);
+    error.clear();
+    if (new_filename.empty() || new_filename.has_parent_path() || new_filename.filename() != new_filename ||
+        new_filename == L"." || new_filename == L"..") { error = "Choose a valid new filename without a directory."; return false; }
+    AssetMetadata metadata;
+    if (!registry_.find_by_id(id, metadata)) { error = "Asset is not registered."; return false; }
+    const auto old_path = metadata.source_path;
+    if (old_path.empty() || old_path.extension() != new_filename.extension() ||
+        (metadata.type == AssetType::Material && !new_filename.filename().wstring().ends_with(L".twmat.json"))) {
+        error = "Rename must preserve the asset file extension."; return false;
+    }
+    const auto new_path = old_path.parent_path() / new_filename;
+    std::string renamed_name = new_filename.stem().string();
+    if (metadata.type == AssetType::Material && renamed_name.ends_with(".twmat")) renamed_name.resize(renamed_name.size() - 6);
+    std::error_code ec;
+    if (std::filesystem::exists(new_path, ec) || ec) { error = ec ? "Cannot inspect destination: " + ec.message() : "An asset with that filename already exists."; return false; }
+    std::filesystem::rename(old_path, new_path, ec);
+    if (ec) { error = "Cannot rename asset source: " + ec.message(); return false; }
+    std::filesystem::path relative;
+    if (!make_relative_asset_path(new_path, relative, error)) { std::filesystem::rename(new_path, old_path, ec); return false; }
+    const auto record = std::find_if(registry_records_.begin(), registry_records_.end(), [&](const auto& entry) { return entry.first == id; });
+    const bool had_record = record != registry_records_.end();
+    const auto old_relative = had_record ? record->second : std::filesystem::path{};
+    if (had_record) record->second = relative; else registry_records_.emplace_back(id, relative);
+    if (!registry_.update_source(id, new_path, std::move(renamed_name))) {
+        std::filesystem::rename(new_path, old_path, ec);
+        if (had_record) record->second = old_relative; else std::erase_if(registry_records_, [&](const auto& entry) { return entry.first == id; });
+        error = "Asset registry entry disappeared during rename.";
+        return false;
+    }
+    if (!save_registry_index(error)) {
+        (void)registry_.update_source(id, old_path, metadata.name);
+        if (had_record) record->second = old_relative; else std::erase_if(registry_records_, [&](const auto& entry) { return entry.first == id; });
+        std::filesystem::rename(new_path, old_path, ec);
+        return false;
+    }
+    return true;
+}
+
+bool AssetPipeline::remove_asset(const std::string& id, const std::span<const std::string> protected_ids, std::string* persistence_error) {
+    std::scoped_lock operation_lock(operation_mutex_);
     if (persistence_error) persistence_error->clear();
+    if (std::find(protected_ids.begin(), protected_ids.end(), id) != protected_ids.end()) {
+        if (persistence_error) *persistence_error = "Asset is referenced and cannot be deleted.";
+        return false;
+    }
+    AssetMetadata metadata;
+    if (!registry_.find_by_id(id, metadata)) return false;
+    std::filesystem::path relative;
+    std::string error;
+    if (!make_relative_asset_path(metadata.source_path, relative, error)) { if (persistence_error) *persistence_error = error; return false; }
+    const auto assets_root = project_root_ / L"Assets";
+    const auto package = assets_root / std::filesystem::u8path(asset_type_name(metadata.type)) /
+        std::filesystem::u8path(metadata.content_hash);
+    if (!path_is_within(package, metadata.source_path) || !path_is_within(assets_root, package)) {
+        if (persistence_error) *persistence_error = "Asset package is outside the managed Assets directory.";
+        return false;
+    }
+    const auto tombstone = package.parent_path() / (package.filename().wstring() + L".deleting");
+    std::error_code ec;
+    if (std::filesystem::exists(tombstone, ec)) { if (persistence_error) *persistence_error = "A prior asset deletion recovery folder exists."; return false; }
+    std::filesystem::rename(package, tombstone, ec);
+    if (ec) { if (persistence_error) *persistence_error = "Cannot stage asset deletion: " + ec.message(); return false; }
+    const auto records_backup = registry_records_;
+    std::erase_if(registry_records_, [&](const auto& record) { return record.first == id; });
+    if (!save_registry_index(error)) {
+        registry_records_ = records_backup;
+        std::filesystem::rename(tombstone, package, ec);
+        if (persistence_error) *persistence_error = error;
+        persistence_errors_.push_back(error);
+        return false;
+    }
+    if (!registry_.remove(id)) {
+        registry_records_ = records_backup;
+        std::string ignored;
+        (void)save_registry_index(ignored);
+        std::filesystem::rename(tombstone, package, ec);
+        if (persistence_error) *persistence_error = "Asset registry entry disappeared during deletion.";
+        return false;
+    }
     {
         std::scoped_lock lock(cache_mutex_);
         cache_.erase(id);
     }
-    const bool removed = registry_.remove(id);
-    if (removed) {
-        std::erase_if(registry_records_, [&](const auto& record) { return record.first == id; });
-        std::string save_error;
-        if (!save_registry_index(save_error)) {
-            persistence_errors_.push_back(save_error);
-            if (persistence_error) *persistence_error = std::move(save_error);
-        }
-    }
-    return removed;
+    std::filesystem::remove_all(tombstone, ec);
+    if (ec) { if (persistence_error) *persistence_error = "Asset is deleted but its temporary cleanup folder remains: " + ec.message(); }
+    return true;
 }
 
 } // namespace together::assets

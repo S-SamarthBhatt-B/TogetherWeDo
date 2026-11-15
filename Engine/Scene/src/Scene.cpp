@@ -408,6 +408,16 @@ const SceneObject* Scene::find_object(const std::uint64_t id) const noexcept {
     return found == objects_.end() ? nullptr : &*found;
 }
 
+bool Scene::references_asset(const std::string_view asset_id) const noexcept {
+    if (asset_id.empty()) return false;
+    return std::any_of(objects_.begin(), objects_.end(), [asset_id](const SceneObject& object) {
+        return std::string_view(object.model_asset_id) == asset_id || std::string_view(object.material_asset_id) == asset_id ||
+            std::string_view(object.material.base_color_texture_id) == asset_id || std::string_view(object.material.normal_texture_id) == asset_id ||
+            std::string_view(object.material.metallic_roughness_texture_id) == asset_id ||
+            std::string_view(object.material.occlusion_texture_id) == asset_id;
+    });
+}
+
 bool Scene::validate(std::string& error) const {
     error.clear();
     if (name_.empty()) { error = "Scene name cannot be empty."; return false; }

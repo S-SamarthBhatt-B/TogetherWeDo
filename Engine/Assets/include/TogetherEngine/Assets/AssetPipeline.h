@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -134,6 +135,7 @@ public:
     AssetImportResult register_asset(AssetMetadata metadata, std::shared_ptr<const AssetPayload> payload);
     bool resolve(AssetHandle handle, AssetMetadata& output) const;
     bool find_by_id(const std::string& id, AssetMetadata& output) const;
+    bool update_source(const std::string& id, std::filesystem::path source_path, std::string name);
     bool remove(const std::string& id);
     std::shared_ptr<const AssetPayload> payload(AssetHandle handle) const;
     std::vector<AssetMetadata> snapshot() const;
@@ -154,10 +156,12 @@ public:
 
     AssetImportResult import_file(const std::filesystem::path& path, TextureQuality quality = TextureQuality::Medium);
     std::future<AssetImportResult> import_async(std::filesystem::path path, TextureQuality quality = TextureQuality::Medium);
+    std::vector<std::string> restore_missing_assets();
     std::vector<AssetMetadata> assets() const { return registry_.snapshot(); }
     bool resolve(AssetHandle handle, AssetMetadata& output) const { return registry_.resolve(handle, output); }
     bool find(const std::string& id, AssetMetadata& output) const { return registry_.find_by_id(id, output); }
-    bool remove_asset(const std::string& id, std::string* persistence_error = nullptr);
+    bool rename_asset(const std::string& id, const std::filesystem::path& new_filename, std::string& error);
+    bool remove_asset(const std::string& id, std::span<const std::string> protected_ids = {}, std::string* error = nullptr);
     std::shared_ptr<const AssetPayload> payload(AssetHandle handle) const { return registry_.payload(handle); }
     std::uint64_t cached_bytes() const;
     const std::filesystem::path& project_root() const noexcept { return project_root_; }
@@ -166,6 +170,7 @@ public:
 private:
     std::filesystem::path project_root_;
     AssetRegistry registry_;
+    mutable std::recursive_mutex operation_mutex_;
     mutable std::mutex cache_mutex_;
     std::unordered_map<std::string, std::shared_ptr<const AssetPayload>> cache_;
     std::mutex queue_mutex_;
@@ -173,13 +178,17 @@ private:
     std::queue<std::function<void()>> jobs_;
     std::jthread worker_;
     std::filesystem::path registry_index_path_;
-    std::vector<std::pair<std::string, std::filesystem::path>> registry_records_;
+    std::vector<std::pair<std::string, std::filesystem::path>> registry_records_; // ID and root-relative source path.
     std::vector<std::string> persistence_errors_;
     bool restoring_registry_{};
 
     void worker_loop(std::stop_token stop_token);
     bool save_registry_index(std::string& error);
     void restore_registry_index();
+    bool make_relative_asset_path(const std::filesystem::path& absolute, std::filesystem::path& relative, std::string& error) const;
+    bool resolve_relative_asset_path(const std::filesystem::path& relative, std::filesystem::path& absolute, std::string& error) const;
+    std::filesystem::path stage_asset_source(const std::filesystem::path& source, AssetType type,
+        const std::string& content_hash, std::string& error) const;
 };
 
 const char* asset_type_name(AssetType type) noexcept;

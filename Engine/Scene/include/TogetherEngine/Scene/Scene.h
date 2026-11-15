@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace together::scene {
@@ -56,6 +57,7 @@ public:
     bool delete_object(std::uint64_t id);
     SceneObject* find_object(std::uint64_t id) noexcept;
     const SceneObject* find_object(std::uint64_t id) const noexcept;
+    bool references_asset(std::string_view asset_id) const noexcept;
 
     bool validate(std::string& error) const;
     bool save(const std::filesystem::path& path, std::string& error) const;

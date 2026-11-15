@@ -85,7 +85,7 @@ enum ControlId : int {
     IdEmissionG,
     IdEmissionB,
     IdAssetDirectory = 400, IdAssetGo, IdAssetSearch, IdAssetFilter, IdAssetList,
-    IdAssetInfo, IdAssetPreview, IdAssetImport, IdAssetRefresh, IdAssetUp
+    IdAssetInfo, IdAssetPreview, IdAssetImport, IdAssetRefresh, IdAssetUp, IdAssetRename, IdAssetDelete
 };
 
 enum MenuId : UINT {
@@ -136,6 +136,8 @@ struct EditorState {
     HWND asset_refresh{};
     HWND asset_up{};
     HWND asset_import_button{};
+    HWND asset_rename_button{};
+    HWND asset_delete_button{};
     HBRUSH panel_brush{};
     HBRUSH edit_brush{};
     HBRUSH console_brush{};
@@ -275,6 +277,50 @@ void update_title();
 void layout_controls(int width, int height);
 void set_dirty();
 bool save_scene(bool choose_path = false);
+
+std::vector<std::string> find_asset_references(const std::string& id, std::wstring& explanation) {
+    std::vector<std::string> protected_ids;
+    if (!g_app || id.empty()) return protected_ids;
+    bool referenced = g_app->scene.references_asset(id);
+    if (referenced) explanation = L"The current scene references this asset.";
+    for (const auto& asset : g_app->assets->assets()) {
+        if (asset.type != together::assets::AssetType::Material) continue;
+        const auto payload = g_app->assets->payload(asset.handle);
+        if (payload && std::holds_alternative<together::assets::MaterialDefinition>(*payload)) {
+            const auto& material = std::get<together::assets::MaterialDefinition>(*payload);
+            if (std::find(material.textures.begin(), material.textures.end(), id) != material.textures.end()) {
+                referenced = true;
+                explanation = L"A registered material references this asset.";
+            }
+        }
+    }
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(g_app->root_path, std::filesystem::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (it->is_directory(ec)) {
+            const auto name = it->path().filename().wstring();
+            if (name == L".git" || name == L"build" || name == L"out") it.disable_recursion_pending();
+            continue;
+        }
+        if (!it->is_regular_file(ec) || !it->path().filename().wstring().ends_with(L".tws.json")) continue;
+        Scene saved;
+        std::string load_error;
+        if (!Scene::load(it->path(), saved, load_error)) {
+            explanation = L"Could not validate project scene references; deletion is blocked: " + it->path().filename().wstring();
+            protected_ids.push_back(id);
+            return protected_ids;
+        }
+        if (saved.references_asset(id)) {
+            referenced = true;
+            explanation = L"Saved scene references this asset: " + it->path().filename().wstring();
+        }
+    }
+    if (ec) {
+        explanation = L"Could not scan all project scenes; deletion is blocked.";
+        protected_ids.push_back(id);
+    } else if (referenced) protected_ids.push_back(id);
+    return protected_ids;
+}
 
 SceneObject* selected_object() {
     return g_app && g_app->selected_id ? g_app->scene.find_object(g_app->selected_id) : nullptr;
@@ -945,6 +991,70 @@ void select_asset_browser_entry(const bool activate) {
     append_console(LogKind::Info, L"Import queued from Asset Browser: " + entry.path.filename().wstring());
 }
 
+void rename_selected_browser_asset() {
+    if (!g_app || asset_operation_busy()) { append_console(LogKind::Warning, L"Wait for asset operations to finish before renaming."); return; }
+    const LRESULT row = SendMessageW(g_app->asset_list, LB_GETCURSEL, 0, 0);
+    if (row == LB_ERR) { append_console(LogKind::Warning, L"Select an imported asset to rename."); return; }
+    const auto index = static_cast<std::size_t>(SendMessageW(g_app->asset_list, LB_GETITEMDATA, static_cast<WPARAM>(row), 0));
+    if (index >= g_app->asset_browser_entries.size() || g_app->asset_browser_entries[index].asset_id.empty()) {
+        append_console(LogKind::Warning, L"Only imported assets can be renamed."); return;
+    }
+    together::assets::AssetMetadata metadata;
+    const auto id = g_app->asset_browser_entries[index].asset_id;
+    if (!g_app->assets->find(id, metadata)) { append_console(LogKind::Error, L"Selected asset is missing from the registry."); return; }
+    wchar_t filename[MAX_PATH]{};
+    wcsncpy_s(filename, metadata.source_path.filename().c_str(), _TRUNCATE);
+    const auto initial_directory = metadata.source_path.parent_path();
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = g_app->window;
+    dialog.lpstrFilter = L"Asset source file\0*.*\0\0"; dialog.lpstrFile = filename; dialog.nMaxFile = MAX_PATH;
+    dialog.lpstrInitialDir = initial_directory.c_str();
+    dialog.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_OVERWRITEPROMPT;
+    if (!GetSaveFileNameW(&dialog)) return;
+    const std::filesystem::path chosen(filename);
+    std::error_code chosen_error, asset_error;
+    const auto chosen_parent = std::filesystem::weakly_canonical(chosen.parent_path(), chosen_error);
+    const auto asset_parent = std::filesystem::weakly_canonical(metadata.source_path.parent_path(), asset_error);
+    if (chosen_error || asset_error || chosen_parent != asset_parent) {
+        append_console(LogKind::Error, L"Rename must keep the asset in its existing package folder."); return;
+    }
+    std::string error;
+    if (!g_app->assets->rename_asset(id, chosen.filename(), error)) {
+        append_console(LogKind::Error, L"Asset rename failed: " + to_wide(error)); return;
+    }
+    refresh_asset_browser();
+    append_console(LogKind::Info, L"Asset renamed. Scene references remain valid because the asset ID did not change.");
+}
+
+void delete_selected_browser_asset() {
+    if (!g_app || asset_operation_busy()) { append_console(LogKind::Warning, L"Wait for asset operations to finish before deleting."); return; }
+    const LRESULT row = SendMessageW(g_app->asset_list, LB_GETCURSEL, 0, 0);
+    if (row == LB_ERR) { append_console(LogKind::Warning, L"Select an imported asset to delete."); return; }
+    const auto index = static_cast<std::size_t>(SendMessageW(g_app->asset_list, LB_GETITEMDATA, static_cast<WPARAM>(row), 0));
+    if (index >= g_app->asset_browser_entries.size() || g_app->asset_browser_entries[index].asset_id.empty()) {
+        append_console(LogKind::Warning, L"Only imported assets can be deleted here."); return;
+    }
+    const std::string id = g_app->asset_browser_entries[index].asset_id;
+    std::wstring reference_reason;
+    const auto protected_ids = find_asset_references(id, reference_reason);
+    if (!protected_ids.empty()) { append_console(LogKind::Error, L"Deletion blocked. " + reference_reason); return; }
+    together::assets::AssetMetadata metadata;
+    if (!g_app->assets->find(id, metadata)) { append_console(LogKind::Error, L"Selected asset is missing from the registry."); return; }
+    const std::wstring prompt = L"Delete " + metadata.source_path.filename().wstring() +
+        L" and its managed asset resources? This cannot be undone.";
+    if (MessageBoxW(g_app->window, prompt.c_str(), L"Delete Asset", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    std::string error;
+    if (!g_app->assets->remove_asset(id, protected_ids, &error)) {
+        append_console(LogKind::Error, L"Asset deletion failed: " + to_wide(error)); return;
+    }
+    g_app->renderer.release_asset(id);
+    if (g_app->latest_asset_id == id) g_app->latest_asset_id.clear();
+    if (g_app->latest_material_asset_id == id) g_app->latest_material_asset_id.clear();
+    if (g_app->latest_texture_asset_id == id) g_app->latest_texture_asset_id.clear();
+    refresh_asset_browser();
+    append_console(LogKind::Info, L"Asset deleted and cached GPU resources released.");
+}
+
 void paint_asset_preview(const DRAWITEMSTRUCT& draw) {
     RECT area = draw.rcItem;
     FillRect(draw.hDC, &area, g_app->console_brush);
@@ -1155,10 +1265,16 @@ void remove_latest_material() {
             return;
         }
     }
-    if (MessageBoxW(g_app->window, L"Remove this material from the current asset registry? Its source file will remain on disk.",
+    std::wstring reference_reason;
+    const auto protected_ids = find_asset_references(id, reference_reason);
+    if (!protected_ids.empty()) {
+        append_console(LogKind::Error, L"Cannot delete material. " + reference_reason);
+        return;
+    }
+    if (MessageBoxW(g_app->window, L"Delete this material source and its managed resources? This cannot be undone.",
         L"Remove Material", MB_YESNO | MB_ICONWARNING) != IDYES) return;
     std::string persistence_error;
-    if (!g_app->assets->remove_asset(id, &persistence_error)) {
+    if (!g_app->assets->remove_asset(id, protected_ids, &persistence_error)) {
         append_console(LogKind::Error, L"Material was already missing from the registry.");
         return;
     }
@@ -1166,7 +1282,8 @@ void remove_latest_material() {
     g_app->renderer.release_asset(id);
     g_app->latest_material_asset_id.clear();
     if (g_app->latest_asset_id == id) g_app->latest_asset_id.clear();
-    append_console(LogKind::Info, L"Material removed from registry and cache; source file preserved.");
+    refresh_asset_browser();
+    append_console(LogKind::Info, L"Material deleted; its GPU resources were released.");
 }
 
 void remove_latest_asset() {
@@ -1190,10 +1307,16 @@ void remove_latest_asset() {
             return;
         }
     }
-    if (MessageBoxW(g_app->window, L"Remove the latest asset from this editor session? The source file on disk will be preserved.",
+    std::wstring reference_reason;
+    const auto protected_ids = find_asset_references(id, reference_reason);
+    if (!protected_ids.empty()) {
+        append_console(LogKind::Error, L"Cannot delete asset. " + reference_reason);
+        return;
+    }
+    if (MessageBoxW(g_app->window, L"Delete the latest asset source and its managed resources? This cannot be undone.",
         L"Remove Asset", MB_YESNO | MB_ICONWARNING) != IDYES) return;
     std::string persistence_error;
-    if (!g_app->assets->remove_asset(id, &persistence_error)) {
+    if (!g_app->assets->remove_asset(id, protected_ids, &persistence_error)) {
         append_console(LogKind::Error, L"Asset was already missing from the registry.");
         return;
     }
@@ -1202,7 +1325,8 @@ void remove_latest_asset() {
     if (g_app->latest_material_asset_id == id) g_app->latest_material_asset_id.clear();
     if (g_app->latest_texture_asset_id == id) g_app->latest_texture_asset_id.clear();
     g_app->latest_asset_id.clear();
-    append_console(LogKind::Info, L"Removed latest asset from registry/cache; source file preserved.");
+    refresh_asset_browser();
+    append_console(LogKind::Info, L"Asset deleted; cached GPU resources were released.");
 }
 
 void assign_latest_material() {
@@ -1379,6 +1503,7 @@ HMENU create_menu_bar() {
         {L"Assign Latest Texture as Ambient Occlusion", 1092},
         {L"Remove Material Assignment", 1087}, {L"Remove Latest Material Asset...", 1088},
         {L"Remove Latest Imported Asset...", 1089},
+        {L"Rename Selected Browser Asset...", IdAssetRename}, {L"Delete Selected Browser Asset...", IdAssetDelete},
         {nullptr, 0}, {L"Open Scene Folder", MenuOpenSceneFolder}});
     add_menu(L"Window", {{L"Reset Layout", MenuResetLayout}, {L"Focus Scene View", MenuFocusViewport}});
     add_menu(L"Help", {{L"About Together Engine Editor", MenuAbout}});
@@ -1405,6 +1530,8 @@ void create_ui(HWND window) {
     g_app->asset_preview = make_control(window, L"STATIC", L"", SS_OWNERDRAW | WS_BORDER, IdAssetPreview, WS_EX_CLIENTEDGE);
     g_app->asset_import_button = make_control(window, L"BUTTON", L"Import...", BS_PUSHBUTTON | WS_TABSTOP, IdAssetImport);
     g_app->asset_refresh = make_control(window, L"BUTTON", L"Refresh", BS_PUSHBUTTON | WS_TABSTOP, IdAssetRefresh);
+    g_app->asset_rename_button = make_control(window, L"BUTTON", L"Rename", BS_PUSHBUTTON | WS_TABSTOP, IdAssetRename);
+    g_app->asset_delete_button = make_control(window, L"BUTTON", L"Delete", BS_PUSHBUTTON | WS_TABSTOP, IdAssetDelete);
     g_app->viewport = make_control(window, kViewportClass, L"", WS_CLIPCHILDREN, IdViewport, WS_EX_CLIENTEDGE);
 
     const auto label = [window](const wchar_t* text) { return make_control(window, L"STATIC", text, SS_LEFT, 0); };
@@ -1476,8 +1603,10 @@ void layout_controls(const int width, const int height) {
     place(g_app->asset_search, 8, browser_y + 45, 92, 24);
     place(g_app->asset_filter, 104, browser_y + 43, kLeftWidth - 112, 120);
     const int browser_footer = console_top - 8;
-    place(g_app->asset_import_button, 8, browser_footer - 32, 92, 26);
-    place(g_app->asset_refresh, 104, browser_footer - 32, kLeftWidth - 112, 26);
+    place(g_app->asset_import_button, 8, browser_footer - 32, 62, 26);
+    place(g_app->asset_refresh, 74, browser_footer - 32, 42, 26);
+    place(g_app->asset_rename_button, 120, browser_footer - 32, 45, 26);
+    place(g_app->asset_delete_button, 169, browser_footer - 32, 45, 26);
     place(g_app->asset_info, 8, browser_footer - 63, kLeftWidth - 16, 28);
     place(g_app->asset_preview, 8, browser_y + 74, kLeftWidth - 16,
         (std::max)(24, browser_footer - 63 - (browser_y + 74)));
@@ -1654,7 +1783,14 @@ void handle_menu_command(const UINT id) {
     case 1090: assign_latest_texture(together::assets::TextureSlot::Normal); break;
     case 1091: assign_latest_texture(together::assets::TextureSlot::Roughness); break;
     case 1092: assign_latest_texture(together::assets::TextureSlot::Occlusion); break;
-    case IdAssetRefresh: refresh_asset_browser(); break;
+    case IdAssetRefresh: {
+        for (const auto& message : g_app->assets->restore_missing_assets())
+            append_console(LogKind::Warning, L"Asset registry recovery: " + to_wide(message));
+        refresh_asset_browser();
+        break;
+    }
+    case IdAssetRename: rename_selected_browser_asset(); break;
+    case IdAssetDelete: delete_selected_browser_asset(); break;
     case 1087:
         if (SceneObject* object = selected_object()) {
             object->material_asset_id.clear();
@@ -1803,10 +1939,14 @@ LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
     switch (message) {
     case WM_CREATE: {
         g_app->window = window;
-        g_app->asset_browser_directory = g_app->root_path;
+        g_app->asset_browser_directory = g_app->root_path / L"Assets";
+        std::error_code asset_folder_error;
+        std::filesystem::create_directories(g_app->asset_browser_directory, asset_folder_error);
         SetMenu(window, create_menu_bar());
         create_ui(window);
         g_app->assets = std::make_unique<together::assets::AssetPipeline>(g_app->root_path);
+        if (asset_folder_error)
+            append_console(LogKind::Error, L"Could not create project Assets folder: " + to_wide(asset_folder_error.message()));
         refresh_asset_browser();
         DragAcceptFiles(g_app->viewport, TRUE);
         RECT rect{};
@@ -1873,7 +2013,13 @@ LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
                 refresh_asset_browser();
             }
             return 0;
-        case IdAssetRefresh: refresh_asset_browser(); return 0;
+        case IdAssetRefresh:
+            for (const auto& message : g_app->assets->restore_missing_assets())
+                append_console(LogKind::Warning, L"Asset registry recovery: " + to_wide(message));
+            refresh_asset_browser();
+            return 0;
+        case IdAssetRename: rename_selected_browser_asset(); return 0;
+        case IdAssetDelete: delete_selected_browser_asset(); return 0;
         case IdAssetImport: import_asset(); return 0;
         case IdAssetList:
             if (notification == LBN_SELCHANGE) select_asset_browser_entry(false);
@@ -1990,6 +2136,22 @@ LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     g_app = std::make_unique<EditorState>();
+    wchar_t executable_path[MAX_PATH]{};
+    const DWORD executable_length = GetModuleFileNameW(nullptr, executable_path, MAX_PATH);
+    if (executable_length > 0 && executable_length < MAX_PATH) {
+        auto candidate = std::filesystem::path(executable_path).parent_path();
+        for (unsigned depth = 0; depth < 8 && !candidate.empty(); ++depth) {
+            std::error_code ec;
+            if (std::filesystem::exists(candidate / L"CMakeLists.txt", ec) &&
+                std::filesystem::exists(candidate / L"Engine" / L"Assets", ec)) {
+                g_app->root_path = candidate;
+                break;
+            }
+            const auto parent = candidate.parent_path();
+            if (parent == candidate) break;
+            candidate = parent;
+        }
+    }
     g_app->panel_brush = CreateSolidBrush(RGB(31, 34, 40));
     g_app->edit_brush = CreateSolidBrush(RGB(43, 47, 54));
     g_app->console_brush = CreateSolidBrush(RGB(24, 27, 32));

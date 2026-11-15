@@ -1,6 +1,7 @@
 #include "TogetherEngine/Assets/AssetPipeline.h"
 
 #include <filesystem>
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <array>
@@ -59,6 +60,8 @@ bool write_triangle_gltf(const std::filesystem::path& path) {
 int main() {
     bool ok = true;
     const auto directory = std::filesystem::temp_directory_path() / "TogetherEngineAssetTests";
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(directory, cleanup_error);
     std::filesystem::create_directories(directory);
 
     MaterialDefinition material;
@@ -113,8 +116,28 @@ int main() {
         AssetPipeline restarted(directory);
         AssetMetadata restored_metadata;
         ok &= check(restarted.find(image.metadata.id, restored_metadata), "asset registry restores imported assets after pipeline restart");
-        ok &= check(restored_metadata.source_path == std::filesystem::absolute(image_path), "persistent registry restores the source path");
+        ok &= check(restored_metadata.source_path == image.metadata.source_path &&
+            restored_metadata.source_path.string().find("Assets") != std::string::npos,
+            "persistent registry restores the staged, project-owned source path");
     }
+    std::string rename_error;
+    ok &= check(pipeline.rename_asset(image.metadata.id, "renamed.tga", rename_error), "asset rename succeeds within its managed package");
+    AssetMetadata renamed_metadata;
+    ok &= check(pipeline.find(image.metadata.id, renamed_metadata) &&
+        renamed_metadata.source_path.filename() == "renamed.tga" && std::filesystem::exists(renamed_metadata.source_path),
+        "rename preserves the stable asset ID and updates the registered source path");
+    {
+        AssetPipeline restarted(directory);
+        AssetMetadata restored;
+        ok &= check(restarted.find(image.metadata.id, restored) && restored.source_path.filename() == "renamed.tga",
+            "renamed asset registry survives restart");
+    }
+    std::filesystem::path registry_path = directory / ".together" / "asset_registry.json";
+    std::ifstream registry_file(registry_path, std::ios::binary);
+    const std::string registry_text((std::istreambuf_iterator<char>(registry_file)), std::istreambuf_iterator<char>());
+    ok &= check(registry_text.find("\"version\": 2") != std::string::npos &&
+        registry_text.find(std::filesystem::absolute(directory).string()) == std::string::npos,
+        "registry stores version 2 project-relative paths rather than absolute project locations");
     const auto invalid_path = directory / "invalid.asset";
     { std::ofstream file(invalid_path); file << "not an asset"; }
     ok &= check(!pipeline.import_file(invalid_path), "unsupported asset types are rejected");
@@ -136,7 +159,13 @@ int main() {
     ok &= check(pipeline.cached_bytes() >= 4, "decoded cache memory is tracked");
     const std::string imported_id = image.metadata.id;
     const AssetHandle removed_handle = image.metadata.handle;
-    ok &= check(pipeline.remove_asset(imported_id), "asset deletion invalidates the registry and decoded cache entry");
+    const auto managed_package = renamed_metadata.source_path.parent_path();
+    const std::array<std::string, 1> protected_asset{imported_id};
+    std::string delete_error;
+    ok &= check(!pipeline.remove_asset(imported_id, protected_asset, &delete_error) &&
+        pipeline.find(imported_id, resolved), "referenced assets are protected from deletion");
+    ok &= check(pipeline.remove_asset(imported_id, {}, &delete_error), "unreferenced asset deletion invalidates the registry and cache");
+    ok &= check(!std::filesystem::exists(managed_package), "asset deletion removes the managed package directory");
     ok &= check(!pipeline.resolve(removed_handle, resolved) && !pipeline.find(imported_id, resolved),
         "removed asset handles and IDs no longer resolve");
     ok &= check(!pipeline.resolve({removed_handle.index, removed_handle.generation + 1}, resolved),
@@ -147,12 +176,97 @@ int main() {
         ok &= check(!after_delete.find(imported_id, resolved), "removed asset remains absent after registry reload");
     }
 
+    // Relocate a complete project copy: project-relative registry paths must resolve from the new root.
+    const auto relocation_a = directory / "relocation_a";
+    const auto relocation_b = directory / "relocation_b";
+    std::filesystem::create_directories(relocation_a);
+    std::string relocated_id;
+    {
+        AssetPipeline source_project(relocation_a);
+        const auto imported = source_project.import_file(image_path, TextureQuality::Original);
+        ok &= check(static_cast<bool>(imported), "asset imports into relocation fixture project");
+        relocated_id = imported.metadata.id;
+    }
+    std::filesystem::copy(relocation_a, relocation_b, std::filesystem::copy_options::recursive);
+    std::filesystem::remove_all(relocation_a);
+    {
+        AssetPipeline moved_project(relocation_b);
+        AssetMetadata moved_asset;
+        ok &= check(moved_project.find(relocated_id, moved_asset) &&
+            moved_asset.source_path.string().find(relocation_b.string()) == 0,
+            "project-relative registry resolves after moving the complete project directory");
+    }
+
+    // Registry v1 migration from an existing legacy absolute source.
+    const auto migration_root = directory / "migration";
+    std::filesystem::create_directories(migration_root / ".together");
+    {
+        AssetPipeline seed(migration_root);
+        const auto imported = seed.import_file(image_path, TextureQuality::Original);
+        relocated_id = imported.metadata.id;
+    }
+    const auto legacy_asset = migration_root / "legacy.tga";
+    std::filesystem::copy_file(image_path, legacy_asset, std::filesystem::copy_options::overwrite_existing);
+    {
+        std::ofstream legacy_index(migration_root / ".together" / "asset_registry.json", std::ios::trunc);
+        auto escaped = std::filesystem::absolute(legacy_asset).string();
+        std::string escaped_json;
+        for (const char ch : escaped) { if (ch == '\\') escaped_json.push_back('\\'); escaped_json.push_back(ch); }
+        legacy_index << "{\"format\":\"TogetherEngineAssetRegistry\",\"version\":1,\"assets\":[{\"id\":\""
+            << relocated_id << "\",\"sourcePath\":\"" << escaped_json << "\"}]}";
+    }
+    {
+        AssetPipeline migrated(migration_root);
+        AssetMetadata restored;
+        ok &= check(migrated.find(relocated_id, restored) &&
+            restored.source_path.string().find((migration_root / "Assets").string()) == 0,
+            "legacy absolute registry entry is staged into the project and restored");
+    }
+
+    // Temporarily missing sources remain recoverable through the persistent registry.
+    const auto recovery_root = directory / "recovery";
+    std::filesystem::create_directories(recovery_root);
+    std::filesystem::path recovery_source;
+    std::string recovery_id;
+    {
+        AssetPipeline recovery(recovery_root);
+        const auto imported = recovery.import_file(image_path, TextureQuality::Original);
+        recovery_source = imported.metadata.source_path;
+        recovery_id = imported.metadata.id;
+    }
+    std::filesystem::remove(recovery_source);
+    {
+        AssetPipeline recovery(recovery_root);
+        AssetMetadata absent;
+        ok &= check(!recovery.find(recovery_id, absent) && !recovery.persistence_errors().empty(),
+            "missing source is reported without registering invalid data");
+        std::filesystem::create_directories(recovery_source.parent_path());
+        std::filesystem::copy_file(image_path, recovery_source);
+        const auto messages = recovery.restore_missing_assets();
+        ok &= check(recovery.find(recovery_id, absent) &&
+            std::any_of(messages.begin(), messages.end(), [](const auto& message) { return message.find("Restored asset") != std::string::npos; }),
+            "restoring the missing relative file recovers its original asset ID");
+    }
+
     const auto broken_root = directory / "broken_registry";
     std::filesystem::create_directories(broken_root / ".together");
     { std::ofstream file(broken_root / ".together" / "asset_registry.json"); file << "{bad registry"; }
     {
         AssetPipeline broken_registry(broken_root);
         ok &= check(!broken_registry.persistence_errors().empty(), "invalid persistent registry data is reported safely");
+    }
+    const auto unsafe_root = directory / "unsafe_registry";
+    std::filesystem::create_directories(unsafe_root / ".together");
+    {
+        std::ofstream unsafe_index(unsafe_root / ".together" / "asset_registry.json", std::ios::trunc);
+        unsafe_index << "{\"format\":\"TogetherEngineAssetRegistry\",\"version\":2,\"assets\":[{\"id\":\""
+            << image.metadata.id << "\",\"sourcePath\":\"../../outside.tga\"}]}";
+    }
+    {
+        AssetPipeline unsafe_registry(unsafe_root);
+        AssetMetadata outside;
+        ok &= check(!unsafe_registry.find(image.metadata.id, outside) && !unsafe_registry.persistence_errors().empty(),
+            "registry paths escaping the project root are rejected and reported");
     }
 
     std::error_code ec;
