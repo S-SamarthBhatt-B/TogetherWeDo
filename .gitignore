@@ -1,0 +1,64 @@
+# CMake and build outputs
+/build/
+/out/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+Testing/
+
+# Compiled binaries and intermediate files
+*.obj
+*.o
+*.pch
+*.pdb
+*.ilk
+*.idb
+*.lib
+*.a
+*.dll
+*.exe
+*.so
+*.dylib
+*.class
+
+# Visual Studio and IDE state
+/.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+ipch/
+.idea/
+.vscode/
+
+# Logs, temporary files, and operating-system metadata
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*.orig
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+secrets.*
+credentials.*
+
+# Generated asset/import caches
+/DerivedDataCache/
+/.asset-cache/
