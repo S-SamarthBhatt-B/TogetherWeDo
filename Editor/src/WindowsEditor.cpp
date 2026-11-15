@@ -83,7 +83,9 @@ enum ControlId : int {
     IdMetallic,
     IdEmissionR,
     IdEmissionG,
-    IdEmissionB
+    IdEmissionB,
+    IdAssetDirectory = 400, IdAssetGo, IdAssetSearch, IdAssetFilter, IdAssetList,
+    IdAssetInfo, IdAssetPreview, IdAssetImport, IdAssetRefresh, IdAssetUp
 };
 
 enum MenuId : UINT {
@@ -98,6 +100,7 @@ enum class LogKind { Info, Build, Warning, Error };
 enum class TransformTool { Select, Move, Rotate, Scale };
 
 struct ConsoleEntry { LogKind kind; std::wstring message; };
+struct AssetBrowserEntry { std::filesystem::path path; bool directory{}; std::string asset_id; };
 enum class PendingGpuAsset { None, Texture, Model };
 
 struct EditorState {
@@ -123,6 +126,16 @@ struct EditorState {
     HWND pause_button{};
     HWND stop_button{};
     HWND build_button{};
+    HWND asset_directory{};
+    HWND asset_search{};
+    HWND asset_filter{};
+    HWND asset_list{};
+    HWND asset_info{};
+    HWND asset_preview{};
+    HWND asset_go{};
+    HWND asset_refresh{};
+    HWND asset_up{};
+    HWND asset_import_button{};
     HBRUSH panel_brush{};
     HBRUSH edit_brush{};
     HBRUSH console_brush{};
@@ -144,6 +157,11 @@ struct EditorState {
     std::vector<ConsoleEntry> console_entries;
     std::filesystem::path scene_path;
     std::filesystem::path root_path{TWDO_ROOT_DIR};
+    std::filesystem::path asset_browser_directory;
+    std::vector<AssetBrowserEntry> asset_browser_entries;
+    std::string browser_drag_asset_id;
+    together::assets::AssetType browser_drag_asset_type{together::assets::AssetType::Texture};
+    bool browser_dragging{};
     std::uint64_t selected_id{};
     bool dirty{};
     bool updating_list{};
@@ -165,6 +183,7 @@ struct EditorState {
 };
 
 std::unique_ptr<EditorState> g_app;
+WNDPROC g_asset_list_original_proc{};
 
 bool upload_texture_asset(D3D11Renderer& renderer, const std::string& id,
     const std::shared_ptr<const together::assets::AssetPayload>& payload) {
@@ -195,7 +214,8 @@ bool upload_model_asset(D3D11Renderer& renderer, const std::string& id,
         converted.reserve(primitive.vertices.size());
         for (const auto& vertex : primitive.vertices) {
             converted.push_back({{vertex.position[0], vertex.position[1], vertex.position[2]},
-                {vertex.normal[0], vertex.normal[1], vertex.normal[2]}, {vertex.uv[0], vertex.uv[1]}});
+                {vertex.normal[0], vertex.normal[1], vertex.normal[2]}, {vertex.uv[0], vertex.uv[1]},
+                {vertex.tangent[0], vertex.tangent[1], vertex.tangent[2], vertex.tangent[3]}});
         }
     }
     for (std::size_t i = 0; i < model.primitives.size(); ++i) {
@@ -250,6 +270,7 @@ void append_console(LogKind kind, std::wstring message);
 void refresh_hierarchy();
 void refresh_inspector();
 void sync_renderer_scene();
+void refresh_asset_browser();
 void update_title();
 void layout_controls(int width, int height);
 void set_dirty();
@@ -336,6 +357,9 @@ void sync_renderer_scene() {
         render_object.model_asset_id = object.model_asset_id;
         render_object.material_asset_id = object.material_asset_id;
         render_object.base_color_texture_id = object.material.base_color_texture_id;
+        render_object.normal_texture_id = object.material.normal_texture_id.empty() ? std::string{} : object.material.normal_texture_id + "#linear";
+        render_object.metallic_roughness_texture_id = object.material.metallic_roughness_texture_id.empty() ? std::string{} : object.material.metallic_roughness_texture_id + "#linear";
+        render_object.occlusion_texture_id = object.material.occlusion_texture_id.empty() ? std::string{} : object.material.occlusion_texture_id + "#linear";
         render_object.material_override = !object.material_asset_id.empty();
         render_object.visible = object.visible;
         render_object.selected = object.id == g_app->selected_id;
@@ -530,6 +554,12 @@ void open_scene() {
             append_console(LogKind::Warning, L"Missing material asset reference preserved in scene: " + to_wide(object.material_asset_id));
         if (!object.material.base_color_texture_id.empty() && !g_app->assets->find(object.material.base_color_texture_id, metadata))
             append_console(LogKind::Warning, L"Missing texture asset reference preserved in scene: " + to_wide(object.material.base_color_texture_id));
+        if (!object.material.normal_texture_id.empty() && !g_app->assets->find(object.material.normal_texture_id, metadata))
+            append_console(LogKind::Warning, L"Missing normal texture reference preserved in scene: " + to_wide(object.material.normal_texture_id));
+        if (!object.material.metallic_roughness_texture_id.empty() && !g_app->assets->find(object.material.metallic_roughness_texture_id, metadata))
+            append_console(LogKind::Warning, L"Missing metallic-roughness texture reference preserved in scene: " + to_wide(object.material.metallic_roughness_texture_id));
+        if (!object.material.occlusion_texture_id.empty() && !g_app->assets->find(object.material.occlusion_texture_id, metadata))
+            append_console(LogKind::Warning, L"Missing AO texture reference preserved in scene: " + to_wide(object.material.occlusion_texture_id));
     }
     refresh_scene_ui();
 }
@@ -804,6 +834,224 @@ void show_asset_list() {
     }
 }
 
+void refresh_asset_browser() {
+    if (!g_app || !g_app->asset_list || !g_app->assets) return;
+    g_app->updating_list = true;
+    SendMessageW(g_app->asset_list, LB_RESETCONTENT, 0, 0);
+    g_app->asset_browser_entries.clear();
+    const std::wstring directory_text = read_control_text(g_app->asset_directory);
+    if (!directory_text.empty()) g_app->asset_browser_directory = directory_text;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(g_app->asset_browser_directory, ec)) {
+        SetWindowTextW(g_app->asset_info, L"Choose an existing folder and press Go.");
+        InvalidateRect(g_app->asset_preview, nullptr, TRUE);
+        g_app->updating_list = false;
+        return;
+    }
+    SetWindowTextW(g_app->asset_directory, g_app->asset_browser_directory.wstring().c_str());
+    const int filter_index = static_cast<int>(SendMessageW(g_app->asset_filter, CB_GETCURSEL, 0, 0));
+    std::wstring search = read_control_text(g_app->asset_search);
+    std::transform(search.begin(), search.end(), search.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+    const auto allowed_type = [filter_index](const std::filesystem::path& path) {
+        if (filter_index == 0) return true;
+        std::wstring name = path.filename().wstring();
+        std::transform(name.begin(), name.end(), name.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+        if (filter_index == 1) return name.ends_with(L".gltf") || name.ends_with(L".glb");
+        if (filter_index == 2) return name.ends_with(L".png") || name.ends_with(L".jpg") || name.ends_with(L".jpeg") || name.ends_with(L".tga");
+        if (filter_index == 3) return name.ends_with(L".twmat.json");
+        return name.ends_with(L".wav");
+    };
+    const auto add_entry = [&](const std::filesystem::path& path, const bool is_directory, const std::string& id = {}) {
+        const std::wstring name = path.filename().wstring();
+        std::wstring folded = name;
+        std::transform(folded.begin(), folded.end(), folded.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+        if (!search.empty() && folded.find(search) == std::wstring::npos) return;
+        if (!is_directory && !allowed_type(path)) return;
+        const std::wstring prefix = is_directory ? L"[Folder]  " : (id.empty() ? L"[File]  " : L"[Asset]  ");
+        const LRESULT row = SendMessageW(g_app->asset_list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>((prefix + name).c_str()));
+        if (row != LB_ERR && row != LB_ERRSPACE) {
+            g_app->asset_browser_entries.push_back({path, is_directory, id});
+            SendMessageW(g_app->asset_list, LB_SETITEMDATA, static_cast<WPARAM>(row), static_cast<LPARAM>(g_app->asset_browser_entries.size() - 1));
+        }
+    };
+    const auto registered_assets = g_app->assets->assets();
+    for (std::filesystem::directory_iterator it(g_app->asset_browser_directory, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code item_error;
+        if (it->is_directory(item_error)) add_entry(it->path(), true);
+        else if (it->is_regular_file(item_error)) {
+            const std::wstring filename = it->path().filename().wstring();
+            std::wstring folded = filename;
+            std::transform(folded.begin(), folded.end(), folded.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+            if (folded.ends_with(L".gltf") || folded.ends_with(L".glb") || folded.ends_with(L".png") || folded.ends_with(L".jpg") ||
+                folded.ends_with(L".jpeg") || folded.ends_with(L".tga") || folded.ends_with(L".wav") || folded.ends_with(L".twmat.json")) {
+                std::string id;
+                for (const auto& asset : registered_assets) {
+                    if (asset.source_path.lexically_normal() == it->path().lexically_normal()) { id = asset.id; break; }
+                }
+                add_entry(it->path(), false, id);
+            }
+        }
+    }
+    if (ec) SetWindowTextW(g_app->asset_info, (L"Directory read failed: " + std::filesystem::path(g_app->asset_browser_directory).wstring()).c_str());
+    else SetWindowTextW(g_app->asset_info, L"Select an asset to inspect it. Double-click a file to import it.");
+    InvalidateRect(g_app->asset_preview, nullptr, TRUE);
+    g_app->updating_list = false;
+}
+
+void select_asset_browser_entry(const bool activate) {
+    if (!g_app || g_app->updating_list) return;
+    const LRESULT row = SendMessageW(g_app->asset_list, LB_GETCURSEL, 0, 0);
+    if (row == LB_ERR) return;
+    const auto index = static_cast<std::size_t>(SendMessageW(g_app->asset_list, LB_GETITEMDATA, static_cast<WPARAM>(row), 0));
+    if (index >= g_app->asset_browser_entries.size()) return;
+    const AssetBrowserEntry entry = g_app->asset_browser_entries[index];
+    if (entry.directory) {
+        if (activate) {
+            g_app->asset_browser_directory = entry.path;
+            SetWindowTextW(g_app->asset_directory, entry.path.wstring().c_str());
+            refresh_asset_browser();
+        }
+        return;
+    }
+    if (!entry.asset_id.empty()) {
+        together::assets::AssetMetadata metadata;
+        if (g_app->assets->find(entry.asset_id, metadata)) {
+            std::wstring details = to_wide(metadata.name) + L"  |  " +
+                to_wide(together::assets::asset_type_name(metadata.type)) + L"  |  " +
+                std::to_wstring(metadata.file_size) + L" bytes  |  " + to_wide(metadata.format);
+            if (metadata.type == together::assets::AssetType::Texture)
+                details += L"  |  " + std::to_wstring(metadata.width) + L" x " + std::to_wstring(metadata.height) +
+                    L"  |  " + std::to_wstring(metadata.mip_levels) + L" mips  |  decoded " + std::to_wstring(metadata.decoded_bytes) + L" bytes";
+            else if (metadata.type == together::assets::AssetType::Model)
+                details += L"  |  " + std::to_wstring(metadata.mesh_count) + L" primitives  |  " +
+                    std::to_wstring(metadata.vertex_count) + L" vertices  |  " + std::to_wstring(metadata.index_count) + L" indices";
+            else if (metadata.type == together::assets::AssetType::Audio)
+                details += L"  |  " + std::to_wstring(metadata.channels) + L" channels  |  decoded " + std::to_wstring(metadata.decoded_bytes) + L" bytes";
+            SetWindowTextW(g_app->asset_info, details.c_str());
+            g_app->latest_asset_id = metadata.id;
+            if (metadata.type == together::assets::AssetType::Texture) g_app->latest_texture_asset_id = metadata.id;
+            if (metadata.type == together::assets::AssetType::Material) g_app->latest_material_asset_id = metadata.id;
+            InvalidateRect(g_app->asset_preview, nullptr, TRUE);
+            return;
+        }
+    }
+    const std::wstring information = entry.path.filename().wstring() + L"  |  Not imported";
+    SetWindowTextW(g_app->asset_info, information.c_str());
+    InvalidateRect(g_app->asset_preview, nullptr, TRUE);
+    if (!activate) return;
+    if (asset_operation_busy()) { append_console(LogKind::Warning, L"Wait for the current import before importing another asset."); return; }
+    g_app->asset_import_path = entry.path;
+    g_app->asset_import = g_app->assets->import_async(entry.path);
+    append_console(LogKind::Info, L"Import queued from Asset Browser: " + entry.path.filename().wstring());
+}
+
+void paint_asset_preview(const DRAWITEMSTRUCT& draw) {
+    RECT area = draw.rcItem;
+    FillRect(draw.hDC, &area, g_app->console_brush);
+    if (!g_app->assets) return;
+    const LRESULT row = SendMessageW(g_app->asset_list, LB_GETCURSEL, 0, 0);
+    if (row == LB_ERR) return;
+    const auto index = static_cast<std::size_t>(SendMessageW(g_app->asset_list, LB_GETITEMDATA, static_cast<WPARAM>(row), 0));
+    if (index >= g_app->asset_browser_entries.size()) return;
+    const AssetBrowserEntry& entry = g_app->asset_browser_entries[index];
+    if (entry.asset_id.empty()) return;
+    together::assets::AssetMetadata metadata;
+    if (!g_app->assets->find(entry.asset_id, metadata)) return;
+    const auto payload = g_app->assets->payload(metadata.handle);
+    if (!payload) return;
+    const int width = (std::max)(1, area.right - area.left - 8);
+    const int height = (std::max)(1, area.bottom - area.top - 8);
+    BITMAPINFO bitmap{};
+    bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmap.bmiHeader.biWidth = 128;
+    bitmap.bmiHeader.biHeight = -128;
+    bitmap.bmiHeader.biPlanes = 1;
+    bitmap.bmiHeader.biBitCount = 32;
+    bitmap.bmiHeader.biCompression = BI_RGB;
+    std::vector<std::uint8_t> pixels(128u * 128u * 4u, 0);
+    if (std::holds_alternative<together::assets::TextureData>(*payload)) {
+        const auto& texture = std::get<together::assets::TextureData>(*payload);
+        for (unsigned y = 0; y < 128; ++y) for (unsigned x = 0; x < 128; ++x) {
+            const unsigned sx = x * texture.width / 128, sy = y * texture.height / 128;
+            const std::size_t source = (static_cast<std::size_t>(sy) * texture.width + sx) * 4;
+            const std::size_t target = (static_cast<std::size_t>(y) * 128 + x) * 4;
+            pixels[target] = texture.rgba8[source + 2]; pixels[target + 1] = texture.rgba8[source + 1];
+            pixels[target + 2] = texture.rgba8[source]; pixels[target + 3] = 255;
+        }
+    } else if (std::holds_alternative<together::assets::MaterialDefinition>(*payload)) {
+        const auto& material = std::get<together::assets::MaterialDefinition>(*payload);
+        const auto base_texture_id = material.textures[static_cast<std::size_t>(together::assets::TextureSlot::BaseColor)];
+        std::shared_ptr<const together::assets::AssetPayload> base_payload;
+        together::assets::AssetMetadata base_metadata;
+        if (!base_texture_id.empty() && g_app->assets->find(base_texture_id, base_metadata)) base_payload = g_app->assets->payload(base_metadata.handle);
+        const together::assets::TextureData* base_texture = base_payload && std::holds_alternative<together::assets::TextureData>(*base_payload)
+            ? &std::get<together::assets::TextureData>(*base_payload) : nullptr;
+        constexpr float light_x = -0.45f, light_y = 0.62f, light_z = 0.64f;
+        const float light_length = std::sqrt(light_x*light_x + light_y*light_y + light_z*light_z);
+        for (unsigned y = 0; y < 128; ++y) for (unsigned x = 0; x < 128; ++x) {
+            const float nx = (static_cast<float>(x) - 63.5f) / 56.0f;
+            const float ny = (63.5f - static_cast<float>(y)) / 56.0f;
+            const float radius2 = nx*nx + ny*ny;
+            if (radius2 > 1.0f) continue;
+            const float nz = std::sqrt(1.0f - radius2);
+            float u = std::atan2(nz, nx) / 6.2831853f + 0.5f;
+            float v = std::acos(std::clamp(ny, -1.0f, 1.0f)) / 3.14159265f;
+            if (base_texture) {
+                const unsigned tx = (std::min)(base_texture->width - 1, static_cast<unsigned>(u * base_texture->width));
+                const unsigned ty = (std::min)(base_texture->height - 1, static_cast<unsigned>(v * base_texture->height));
+                const std::size_t at = (static_cast<std::size_t>(ty) * base_texture->width + tx) * 4;
+                const float diffuse_factor = 1.0f - material.metallic;
+                const float ndotl = (std::max)(0.0f, (nx*light_x + ny*light_y + nz*light_z) / light_length);
+                const float highlight = std::pow(ndotl, 8.0f + (1.0f - material.roughness) * 80.0f) * (0.04f + material.metallic * 0.8f);
+                const std::size_t target = (static_cast<std::size_t>(y) * 128 + x) * 4;
+                const std::array<float,3> color{base_texture->rgba8[at] / 255.0f * material.base_color[0],
+                    base_texture->rgba8[at+1] / 255.0f * material.base_color[1], base_texture->rgba8[at+2] / 255.0f * material.base_color[2]};
+                for (unsigned c = 0; c < 3; ++c) {
+                    const float shaded = color[c] * (0.16f + ndotl * 0.78f * diffuse_factor) + highlight + material.emission[c];
+                    pixels[target + (2 - c)] = static_cast<std::uint8_t>(std::clamp(shaded, 0.0f, 1.0f) * 255.0f);
+                }
+                pixels[target + 3] = 255;
+            } else {
+                const float diffuse_factor = 1.0f - material.metallic;
+                const float ndotl = (std::max)(0.0f, (nx*light_x + ny*light_y + nz*light_z) / light_length);
+                const float highlight = std::pow(ndotl, 8.0f + (1.0f - material.roughness) * 80.0f) * (0.04f + material.metallic * 0.8f);
+                const std::size_t target = (static_cast<std::size_t>(y) * 128 + x) * 4;
+                for (unsigned c = 0; c < 3; ++c) {
+                    const float shaded = material.base_color[c] * (0.16f + ndotl * 0.78f * diffuse_factor) + highlight + material.emission[c];
+                    pixels[target + (2 - c)] = static_cast<std::uint8_t>(std::clamp(shaded, 0.0f, 1.0f) * 255.0f);
+                }
+                pixels[target + 3] = 255;
+            }
+        }
+    } else if (std::holds_alternative<together::assets::ModelData>(*payload)) {
+        const auto& model = std::get<together::assets::ModelData>(*payload);
+        const float sx = model.bounds.maximum[0] - model.bounds.minimum[0];
+        const float sy = model.bounds.maximum[1] - model.bounds.minimum[1];
+        const float scale = 104.0f / (std::max)({sx, sy, 0.001f});
+        for (const auto& primitive : model.primitives) {
+            const COLORREF color = RGB(static_cast<BYTE>(primitive.base_color[0] * 255),
+                static_cast<BYTE>(primitive.base_color[1] * 255), static_cast<BYTE>(primitive.base_color[2] * 255));
+            HBRUSH brush = CreateSolidBrush(color);
+            HGDIOBJ previous = SelectObject(draw.hDC, brush);
+            const std::size_t triangles = (std::min)(primitive.indices.size() / 3, std::size_t{1200});
+            for (std::size_t tri = 0; tri < triangles; ++tri) {
+                POINT points[3]{};
+                for (std::size_t corner = 0; corner < 3; ++corner) {
+                    const auto& vertex = primitive.vertices[primitive.indices[tri*3+corner]];
+                    points[corner].x = area.left + 4 + static_cast<LONG>((vertex.position[0] - model.bounds.minimum[0]) * scale + (128 - sx*scale)*0.5f);
+                    points[corner].y = area.top + 4 + static_cast<LONG>((model.bounds.maximum[1] - vertex.position[1]) * scale + (128 - sy*scale)*0.5f);
+                }
+                Polygon(draw.hDC, points, 3);
+            }
+            SelectObject(draw.hDC, previous);
+            DeleteObject(brush);
+        }
+        return;
+    } else return;
+    StretchDIBits(draw.hDC, area.left + (area.right-area.left-width)/2, area.top + (area.bottom-area.top-height)/2,
+        width, height, 0, 0, 128, 128, pixels.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY);
+}
+
 void create_material_asset() {
     if (asset_operation_busy()) {
         append_console(LogKind::Warning, L"Wait for the current asset import to finish before creating another asset.");
@@ -864,6 +1112,10 @@ void save_selected_material_as() {
     material.roughness = object->material.roughness;
     material.emission = {object->material.emission.x, object->material.emission.y, object->material.emission.z};
     material.textures[static_cast<std::size_t>(together::assets::TextureSlot::BaseColor)] = object->material.base_color_texture_id;
+    material.textures[static_cast<std::size_t>(together::assets::TextureSlot::Normal)] = object->material.normal_texture_id;
+    material.textures[static_cast<std::size_t>(together::assets::TextureSlot::Roughness)] = object->material.metallic_roughness_texture_id;
+    material.textures[static_cast<std::size_t>(together::assets::TextureSlot::Metallic)] = object->material.metallic_roughness_texture_id;
+    material.textures[static_cast<std::size_t>(together::assets::TextureSlot::Occlusion)] = object->material.occlusion_texture_id;
     wchar_t path[MAX_PATH]{};
     wcscpy_s(path, L"Material.twmat.json");
     OPENFILENAMEW dialog{};
@@ -905,10 +1157,12 @@ void remove_latest_material() {
     }
     if (MessageBoxW(g_app->window, L"Remove this material from the current asset registry? Its source file will remain on disk.",
         L"Remove Material", MB_YESNO | MB_ICONWARNING) != IDYES) return;
-    if (!g_app->assets->remove_asset(id)) {
+    std::string persistence_error;
+    if (!g_app->assets->remove_asset(id, &persistence_error)) {
         append_console(LogKind::Error, L"Material was already missing from the registry.");
         return;
     }
+    if (!persistence_error.empty()) append_console(LogKind::Error, L"Material removed in memory, but registry update failed: " + to_wide(persistence_error));
     g_app->renderer.release_asset(id);
     g_app->latest_material_asset_id.clear();
     if (g_app->latest_asset_id == id) g_app->latest_asset_id.clear();
@@ -920,7 +1174,8 @@ void remove_latest_asset() {
     const std::string id = g_app->latest_asset_id;
     if (id.empty()) { append_console(LogKind::Warning, L"No imported asset is selected."); return; }
     for (const SceneObject& object : g_app->scene.objects()) {
-        if (object.model_asset_id == id || object.material_asset_id == id || object.material.base_color_texture_id == id) {
+        if (object.model_asset_id == id || object.material_asset_id == id || object.material.base_color_texture_id == id ||
+            object.material.normal_texture_id == id || object.material.metallic_roughness_texture_id == id || object.material.occlusion_texture_id == id) {
             append_console(LogKind::Error, L"Cannot remove an asset while a scene object references it. Clear the reference first.");
             return;
         }
@@ -937,10 +1192,12 @@ void remove_latest_asset() {
     }
     if (MessageBoxW(g_app->window, L"Remove the latest asset from this editor session? The source file on disk will be preserved.",
         L"Remove Asset", MB_YESNO | MB_ICONWARNING) != IDYES) return;
-    if (!g_app->assets->remove_asset(id)) {
+    std::string persistence_error;
+    if (!g_app->assets->remove_asset(id, &persistence_error)) {
         append_console(LogKind::Error, L"Asset was already missing from the registry.");
         return;
     }
+    if (!persistence_error.empty()) append_console(LogKind::Error, L"Asset removed in memory, but registry update failed: " + to_wide(persistence_error));
     g_app->renderer.release_asset(id);
     if (g_app->latest_material_asset_id == id) g_app->latest_material_asset_id.clear();
     if (g_app->latest_texture_asset_id == id) g_app->latest_texture_asset_id.clear();
@@ -971,30 +1228,131 @@ void assign_latest_material() {
     object->material.metallic = material.metallic;
     object->material.emission = {material.emission[0], material.emission[1], material.emission[2]};
     object->material.base_color_texture_id = material.textures[static_cast<std::size_t>(together::assets::TextureSlot::BaseColor)];
+    object->material.normal_texture_id = material.textures[static_cast<std::size_t>(together::assets::TextureSlot::Normal)];
+    const auto roughness_map = material.textures[static_cast<std::size_t>(together::assets::TextureSlot::Roughness)];
+    const auto metallic_map = material.textures[static_cast<std::size_t>(together::assets::TextureSlot::Metallic)];
+    object->material.metallic_roughness_texture_id = roughness_map.empty() ? metallic_map : roughness_map;
+    object->material.occlusion_texture_id = material.textures[static_cast<std::size_t>(together::assets::TextureSlot::Occlusion)];
     set_dirty();
     refresh_inspector();
     sync_renderer_scene();
     append_console(LogKind::Info, L"Material assigned to selected object.");
 }
 
-void assign_latest_texture() {
+void assign_latest_texture(const together::assets::TextureSlot slot = together::assets::TextureSlot::BaseColor) {
     SceneObject* object = selected_object();
     if (!object || g_app->latest_texture_asset_id.empty()) {
         append_console(LogKind::Warning, L"Select an object and import a texture first.");
         return;
     }
     const std::string shared_id = object->material_asset_id;
-    object->material.base_color_texture_id = g_app->latest_texture_asset_id;
+    const auto set_slot = [slot](SceneObject& target, const std::string& id) {
+        if (slot == together::assets::TextureSlot::BaseColor) target.material.base_color_texture_id = id;
+        else if (slot == together::assets::TextureSlot::Normal) target.material.normal_texture_id = id;
+        else if (slot == together::assets::TextureSlot::Roughness || slot == together::assets::TextureSlot::Metallic)
+            target.material.metallic_roughness_texture_id = id;
+        else if (slot == together::assets::TextureSlot::Occlusion) target.material.occlusion_texture_id = id;
+    };
+    set_slot(*object, g_app->latest_texture_asset_id);
     if (!shared_id.empty()) {
         for (const SceneObject& candidate : g_app->scene.objects()) {
             if (candidate.id == object->id || candidate.material_asset_id != shared_id) continue;
             if (SceneObject* shared = g_app->scene.find_object(candidate.id))
-                shared->material.base_color_texture_id = g_app->latest_texture_asset_id;
+                set_slot(*shared, g_app->latest_texture_asset_id);
         }
     }
     set_dirty();
     sync_renderer_scene();
     append_console(LogKind::Info, L"Base color texture assigned.");
+}
+
+void perform_browser_drop(const POINT screen_point) {
+    if (!g_app || g_app->browser_drag_asset_id.empty()) return;
+    RECT viewport_rect{};
+    GetWindowRect(g_app->viewport, &viewport_rect);
+    if (!PtInRect(&viewport_rect, screen_point)) return;
+    if (g_app->playing) { append_console(LogKind::Warning, L"Stop the Play Preview before dropping assets into the scene."); return; }
+    if (asset_operation_busy()) {
+        append_console(LogKind::Warning, L"Wait for current asset/GPU work to finish before dropping another asset.");
+        return;
+    }
+    together::assets::AssetMetadata metadata;
+    if (!g_app->assets->find(g_app->browser_drag_asset_id, metadata)) {
+        append_console(LogKind::Error, L"Drop rejected: asset reference is missing from the registry.");
+        return;
+    }
+    if (metadata.type == together::assets::AssetType::Model) {
+        SceneObject& object = g_app->scene.create_object(metadata.name);
+        object.model_asset_id = metadata.id;
+        const int viewport_width = (std::max)(1, viewport_rect.right - viewport_rect.left);
+        const int viewport_height = (std::max)(1, viewport_rect.bottom - viewport_rect.top);
+        object.transform.position.x = static_cast<float>(screen_point.x - (viewport_rect.left + viewport_width / 2)) * 0.025f;
+        object.transform.position.z = static_cast<float>((viewport_rect.top + viewport_height / 2) - screen_point.y) * 0.025f;
+        g_app->selected_id = object.id;
+        set_dirty(); refresh_scene_ui();
+        append_console(LogKind::Info, L"Model instance created from Asset Browser drop.");
+        return;
+    }
+    if (metadata.type == together::assets::AssetType::Material) {
+        if (!selected_object()) { append_console(LogKind::Warning, L"Select a scene object before dropping a material onto the viewport."); return; }
+        g_app->latest_material_asset_id = metadata.id;
+        assign_latest_material();
+        return;
+    }
+    if (metadata.type == together::assets::AssetType::Texture) {
+        if (!selected_object()) { append_console(LogKind::Warning, L"Select a scene object before dropping a texture into the viewport."); return; }
+        g_app->latest_texture_asset_id = metadata.id;
+        const auto slot = (GetKeyState(VK_MENU) & 0x8000) ? together::assets::TextureSlot::Occlusion :
+            (GetKeyState(VK_CONTROL) & 0x8000) ? together::assets::TextureSlot::Roughness :
+            (GetKeyState(VK_SHIFT) & 0x8000) ? together::assets::TextureSlot::Normal : together::assets::TextureSlot::BaseColor;
+        assign_latest_texture(slot);
+        return;
+    }
+    append_console(LogKind::Warning, L"Audio assets cannot be assigned to scene objects.");
+}
+
+LRESULT CALLBACK asset_list_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (!g_asset_list_original_proc) return DefWindowProcW(window, message, wparam, lparam);
+    if (message == WM_LBUTTONDOWN) {
+        const LRESULT result = CallWindowProcW(g_asset_list_original_proc, window, message, wparam, lparam);
+        if (g_app) {
+            const LRESULT row = SendMessageW(window, LB_GETCURSEL, 0, 0);
+            if (row != LB_ERR) {
+                const auto index = static_cast<std::size_t>(SendMessageW(window, LB_GETITEMDATA, static_cast<WPARAM>(row), 0));
+                if (index < g_app->asset_browser_entries.size()) {
+                    const auto& entry = g_app->asset_browser_entries[index];
+                    g_app->browser_drag_asset_id = entry.asset_id;
+                    g_app->browser_dragging = !entry.directory && !entry.asset_id.empty();
+                    if (g_app->browser_dragging) {
+                        together::assets::AssetMetadata metadata;
+                        if (g_app->assets->find(entry.asset_id, metadata)) g_app->browser_drag_asset_type = metadata.type;
+                        SetCapture(window);
+                        SetWindowTextW(g_app->asset_info, L"Drag to viewport. Texture: Shift=Normal, Ctrl=Metal/Roughness, Alt=AO.");
+                    }
+                }
+            }
+        }
+        return result;
+    }
+    if (message == WM_MOUSEMOVE && g_app && g_app->browser_dragging && (wparam & MK_LBUTTON)) {
+        POINT screen{}; GetCursorPos(&screen);
+        RECT viewport{}; GetWindowRect(g_app->viewport, &viewport);
+        const bool inside = PtInRect(&viewport, screen) != FALSE;
+        const bool accepts = g_app->browser_drag_asset_type == together::assets::AssetType::Model ||
+            (selected_object() && (g_app->browser_drag_asset_type == together::assets::AssetType::Material ||
+                g_app->browser_drag_asset_type == together::assets::AssetType::Texture));
+        SetCursor(LoadCursorW(nullptr, inside && accepts ? IDC_HAND : IDC_NO));
+        return 0;
+    }
+    if (message == WM_LBUTTONUP && g_app && g_app->browser_dragging) {
+        POINT screen{}; GetCursorPos(&screen);
+        g_app->browser_dragging = false;
+        ReleaseCapture();
+        perform_browser_drop(screen);
+        g_app->browser_drag_asset_id.clear();
+        return 0;
+    }
+    return CallWindowProcW(g_asset_list_original_proc, window, message, wparam, lparam);
 }
 
 HMENU create_menu_bar() {
@@ -1014,8 +1372,11 @@ HMENU create_menu_bar() {
     add_menu(L"Scene", {{L"Validate Scene", MenuValidate}});
     add_menu(L"GameObject", {{L"Create Cube\tCtrl+Shift+N", MenuCreateCube}});
     add_menu(L"Assets", {{L"List Imported Assets in Console", 1081}, {L"Import Asset...", 1082},
+        {L"Refresh Asset Browser", IdAssetRefresh},
         {L"Create Material...", 1083}, {L"Save/Rename Object Material As...", 1084},
-        {L"Assign Latest Material", 1085}, {L"Assign Latest Texture", 1086},
+        {L"Assign Latest Material", 1085}, {L"Assign Latest Texture as Base Color", 1086},
+        {L"Assign Latest Texture as Normal Map", 1090}, {L"Assign Latest Texture as Metallic/Roughness", 1091},
+        {L"Assign Latest Texture as Ambient Occlusion", 1092},
         {L"Remove Material Assignment", 1087}, {L"Remove Latest Material Asset...", 1088},
         {L"Remove Latest Imported Asset...", 1089},
         {nullptr, 0}, {L"Open Scene Folder", MenuOpenSceneFolder}});
@@ -1029,6 +1390,21 @@ void create_ui(HWND window) {
     g_app->object_list = make_control(window, L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP, IdObjectList, WS_EX_CLIENTEDGE);
     make_control(window, L"BUTTON", L"+ Create Cube", BS_PUSHBUTTON | WS_TABSTOP, IdCreate);
     make_control(window, L"BUTTON", L"Delete", BS_PUSHBUTTON | WS_TABSTOP, IdDelete);
+    g_app->asset_directory = make_control(window, L"EDIT", g_app->asset_browser_directory.wstring().c_str(), ES_AUTOHSCROLL | WS_TABSTOP, IdAssetDirectory, WS_EX_CLIENTEDGE);
+    g_app->asset_go = make_control(window, L"BUTTON", L"Go", BS_PUSHBUTTON | WS_TABSTOP, IdAssetGo);
+    g_app->asset_up = make_control(window, L"BUTTON", L"Up", BS_PUSHBUTTON | WS_TABSTOP, IdAssetUp);
+    g_app->asset_search = make_control(window, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, IdAssetSearch, WS_EX_CLIENTEDGE);
+    g_app->asset_filter = make_control(window, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IdAssetFilter);
+    for (const wchar_t* filter : {L"All Types", L"Models", L"Textures", L"Materials", L"Audio"})
+        SendMessageW(g_app->asset_filter, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(filter));
+    SendMessageW(g_app->asset_filter, CB_SETCURSEL, 0, 0);
+    g_app->asset_list = make_control(window, L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP, IdAssetList, WS_EX_CLIENTEDGE);
+    g_asset_list_original_proc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_app->asset_list, GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(asset_list_proc)));
+    g_app->asset_info = make_control(window, L"STATIC", L"Select an asset to inspect it.", SS_LEFT | SS_NOPREFIX, IdAssetInfo);
+    g_app->asset_preview = make_control(window, L"STATIC", L"", SS_OWNERDRAW | WS_BORDER, IdAssetPreview, WS_EX_CLIENTEDGE);
+    g_app->asset_import_button = make_control(window, L"BUTTON", L"Import...", BS_PUSHBUTTON | WS_TABSTOP, IdAssetImport);
+    g_app->asset_refresh = make_control(window, L"BUTTON", L"Refresh", BS_PUSHBUTTON | WS_TABSTOP, IdAssetRefresh);
     g_app->viewport = make_control(window, kViewportClass, L"", WS_CLIPCHILDREN, IdViewport, WS_EX_CLIENTEDGE);
 
     const auto label = [window](const wchar_t* text) { return make_control(window, L"STATIC", text, SS_LEFT, 0); };
@@ -1063,12 +1439,14 @@ void create_ui(HWND window) {
     SendMessageW(g_app->console_filter, CB_SETCURSEL, 0, 0);
     g_app->build_button = make_control(window, L"BUTTON", L"Build Editor", BS_PUSHBUTTON | WS_TABSTOP, IdBuild);
     g_app->console = make_control(window, L"LISTBOX", L"", LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_HSCROLL, IdConsole, WS_EX_CLIENTEDGE);
-    for (HWND control : {g_app->search, g_app->object_list, g_app->viewport, g_app->visible, g_app->inspector_apply,
+    for (HWND control : {g_app->search, g_app->object_list, g_app->asset_directory, g_app->asset_search, g_app->asset_list,
+        g_app->asset_filter, g_app->viewport, g_app->visible, g_app->inspector_apply,
         g_app->roughness, g_app->metallic, g_app->console, g_app->console_filter, g_app->build_button}) {
         if (control) SetWindowTheme(control, L"DarkMode_Explorer", nullptr);
     }
     set_tool(TransformTool::Select);
     refresh_inspector();
+    refresh_asset_browser();
 }
 
 void layout_controls(const int width, const int height) {
@@ -1087,9 +1465,22 @@ void layout_controls(const int width, const int height) {
     place(g_app->pause_button, 390, kToolbarY, 68, kToolbarHeight);
     place(g_app->stop_button, 462, kToolbarY, 68, kToolbarHeight);
     place(g_app->search, 8, 50, kLeftWidth - 16, 25);
-    place(g_app->object_list, 8, 82, kLeftWidth - 16, (std::max)(50, scene_height - 146));
-    place(GetDlgItem(g_app->window, IdCreate), 8, console_top - 56, 126, 30);
-    place(GetDlgItem(g_app->window, IdDelete), 140, console_top - 56, 66, 30);
+    const int hierarchy_height = (std::max)(100, scene_height * 38 / 100);
+    place(g_app->object_list, 8, 82, kLeftWidth - 16, hierarchy_height);
+    place(GetDlgItem(g_app->window, IdCreate), 8, 86 + hierarchy_height, 122, 28);
+    place(GetDlgItem(g_app->window, IdDelete), 134, 86 + hierarchy_height, 72, 28);
+    const int browser_y = 120 + hierarchy_height;
+    place(g_app->asset_directory, 8, browser_y + 16, kLeftWidth - 102, 24);
+    place(g_app->asset_go, kLeftWidth - 91, browser_y + 16, 40, 24);
+    place(g_app->asset_up, kLeftWidth - 47, browser_y + 16, 39, 24);
+    place(g_app->asset_search, 8, browser_y + 45, 92, 24);
+    place(g_app->asset_filter, 104, browser_y + 43, kLeftWidth - 112, 120);
+    const int browser_footer = console_top - 8;
+    place(g_app->asset_import_button, 8, browser_footer - 32, 92, 26);
+    place(g_app->asset_refresh, 104, browser_footer - 32, kLeftWidth - 112, 26);
+    place(g_app->asset_info, 8, browser_footer - 63, kLeftWidth - 16, 28);
+    place(g_app->asset_preview, 8, browser_y + 74, kLeftWidth - 16,
+        (std::max)(24, browser_footer - 63 - (browser_y + 74)));
     place(g_app->viewport, viewport_x, kToolbarHeight, viewport_width, scene_height);
 
     const int label_x = inspector_x + 12;
@@ -1260,6 +1651,10 @@ void handle_menu_command(const UINT id) {
     case 1084: save_selected_material_as(); break;
     case 1085: assign_latest_material(); break;
     case 1086: assign_latest_texture(); break;
+    case 1090: assign_latest_texture(together::assets::TextureSlot::Normal); break;
+    case 1091: assign_latest_texture(together::assets::TextureSlot::Roughness); break;
+    case 1092: assign_latest_texture(together::assets::TextureSlot::Occlusion); break;
+    case IdAssetRefresh: refresh_asset_browser(); break;
     case 1087:
         if (SceneObject* object = selected_object()) {
             object->material_asset_id.clear();
@@ -1284,6 +1679,11 @@ void editor_tick() {
     if (g_app->asset_import.valid() && g_app->asset_import.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         const auto result = g_app->asset_import.get();
         if (result) {
+            if (!result.persistence_error.empty())
+                append_console(LogKind::Error, L"Asset imported in memory, but registry persistence failed: " + to_wide(result.persistence_error));
+            g_app->asset_browser_directory = result.metadata.source_path.parent_path();
+            SetWindowTextW(g_app->asset_directory, g_app->asset_browser_directory.wstring().c_str());
+            refresh_asset_browser();
             g_app->latest_asset_id = result.metadata.id;
             append_console(LogKind::Info, (result.duplicate ? L"Asset already imported: " : L"Asset imported: ") + to_wide(result.metadata.name));
             if (result.metadata.type == together::assets::AssetType::Texture) {
@@ -1403,9 +1803,11 @@ LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
     switch (message) {
     case WM_CREATE: {
         g_app->window = window;
+        g_app->asset_browser_directory = g_app->root_path;
         SetMenu(window, create_menu_bar());
         create_ui(window);
         g_app->assets = std::make_unique<together::assets::AssetPipeline>(g_app->root_path);
+        refresh_asset_browser();
         DragAcceptFiles(g_app->viewport, TRUE);
         RECT rect{};
         GetClientRect(window, &rect);
@@ -1415,6 +1817,17 @@ LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         if (!g_app->renderer.initialize(g_app->viewport, static_cast<unsigned>(viewport_rect.right), static_cast<unsigned>(viewport_rect.bottom))) {
             MessageBoxW(window, L"D3D11 scene view could not be initialized. See TogetherWeDo.log for details.", L"Editor Startup Error", MB_OK | MB_ICONERROR);
             return -1;
+        }
+        for (const auto& persistence_error : g_app->assets->persistence_errors())
+            append_console(LogKind::Warning, L"Asset registry: " + to_wide(persistence_error));
+        for (const auto& asset : g_app->assets->assets()) {
+            const auto payload = g_app->assets->payload(asset.handle);
+            bool uploaded = true;
+            if (asset.type == together::assets::AssetType::Texture)
+                uploaded = upload_texture_asset(g_app->renderer, asset.id, payload);
+            else if (asset.type == together::assets::AssetType::Model)
+                uploaded = upload_model_asset(g_app->renderer, asset.id, payload);
+            if (!uploaded) append_console(LogKind::Error, L"Could not restore GPU resource for " + to_wide(asset.name));
         }
         g_app->scene.create_object();
         g_app->scene.create_object("Second Cube").transform.position = {2.0f, 0.5f, 0.0f};
@@ -1443,6 +1856,28 @@ LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         switch (id) {
         case IdSearch:
             if (notification == EN_CHANGE) refresh_hierarchy();
+            return 0;
+        case IdAssetSearch:
+            if (notification == EN_CHANGE) refresh_asset_browser();
+            return 0;
+        case IdAssetFilter:
+            if (notification == CBN_SELCHANGE) refresh_asset_browser();
+            return 0;
+        case IdAssetGo:
+            refresh_asset_browser();
+            return 0;
+        case IdAssetUp:
+            if (!g_app->asset_browser_directory.parent_path().empty()) {
+                g_app->asset_browser_directory = g_app->asset_browser_directory.parent_path();
+                SetWindowTextW(g_app->asset_directory, g_app->asset_browser_directory.wstring().c_str());
+                refresh_asset_browser();
+            }
+            return 0;
+        case IdAssetRefresh: refresh_asset_browser(); return 0;
+        case IdAssetImport: import_asset(); return 0;
+        case IdAssetList:
+            if (notification == LBN_SELCHANGE) select_asset_browser_entry(false);
+            else if (notification == LBN_DBLCLK) select_asset_browser_entry(true);
             return 0;
         case IdObjectList:
             if (notification == LBN_SELCHANGE && !g_app->updating_list) update_inspector_from_selection();
@@ -1474,7 +1909,8 @@ LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         if (wparam == kEditorTimer) editor_tick();
         return 0;
     case WM_KEYDOWN:
-        if (wparam == VK_DELETE) delete_selected();
+        if (GetFocus() == g_app->asset_directory && wparam == VK_RETURN) refresh_asset_browser();
+        else if (wparam == VK_DELETE) delete_selected();
         else if ((GetKeyState(VK_CONTROL) & 0x8000) && (GetKeyState(VK_SHIFT) & 0x8000) && wparam == 'N') create_cube();
         else if ((GetKeyState(VK_CONTROL) & 0x8000) && wparam == 'S') save_scene();
         else if ((GetKeyState(VK_CONTROL) & 0x8000) && wparam == 'N') new_scene();
@@ -1499,6 +1935,12 @@ LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         SetBkColor(dc, RGB(49, 54, 62));
         return reinterpret_cast<LRESULT>(g_app->panel_brush);
     }
+    case WM_DRAWITEM:
+        if (wparam == IdAssetPreview && lparam) {
+            paint_asset_preview(*reinterpret_cast<const DRAWITEMSTRUCT*>(lparam));
+            return TRUE;
+        }
+        break;
     case WM_PAINT: {
         PAINTSTRUCT paint{};
         HDC dc = BeginPaint(window, &paint);
@@ -1513,6 +1955,13 @@ LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
         FillRect(dc, &right, g_app->panel_brush);
         RECT console{0, client.bottom - kConsoleHeight, client.right, client.bottom};
         FillRect(dc, &console, g_app->console_brush);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(170, 185, 204));
+        const int console_top = (std::max)(kToolbarHeight + 100, static_cast<int>(client.bottom) - kConsoleHeight);
+        const int scene_height = (std::max)(80, console_top - kToolbarHeight);
+        const int hierarchy_height = (std::max)(100, scene_height * 38 / 100);
+        TextOutW(dc, 8, 37, L"SCENE HIERARCHY", 15);
+        TextOutW(dc, 8, 102 + hierarchy_height, L"ASSET BROWSER", 13);
         EndPaint(window, &paint);
         return 0;
     }

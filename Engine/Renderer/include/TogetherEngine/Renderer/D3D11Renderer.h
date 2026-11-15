@@ -35,6 +35,9 @@ struct RenderObject {
     std::string model_asset_id;
     std::string material_asset_id;
     std::string base_color_texture_id;
+    std::string normal_texture_id;
+    std::string metallic_roughness_texture_id;
+    std::string occlusion_texture_id;
     bool material_override{};
     bool visible{true};
     bool selected{};
@@ -44,6 +47,7 @@ struct ModelVertex {
     DirectX::XMFLOAT3 position{};
     DirectX::XMFLOAT3 normal{0.0f, 1.0f, 0.0f};
     DirectX::XMFLOAT2 uv{};
+    DirectX::XMFLOAT4 tangent{1,0,0,1};
 };
 
 struct ModelPrimitiveUpload {

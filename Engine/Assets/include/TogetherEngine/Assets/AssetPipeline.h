@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -124,6 +125,7 @@ struct AssetImportResult {
     std::shared_ptr<const AssetPayload> payload;
     bool duplicate{};
     std::string error;
+    std::string persistence_error;
     explicit operator bool() const noexcept { return metadata.handle.valid() && payload && error.empty(); }
 };
 
@@ -155,10 +157,11 @@ public:
     std::vector<AssetMetadata> assets() const { return registry_.snapshot(); }
     bool resolve(AssetHandle handle, AssetMetadata& output) const { return registry_.resolve(handle, output); }
     bool find(const std::string& id, AssetMetadata& output) const { return registry_.find_by_id(id, output); }
-    bool remove_asset(const std::string& id);
+    bool remove_asset(const std::string& id, std::string* persistence_error = nullptr);
     std::shared_ptr<const AssetPayload> payload(AssetHandle handle) const { return registry_.payload(handle); }
     std::uint64_t cached_bytes() const;
     const std::filesystem::path& project_root() const noexcept { return project_root_; }
+    const std::vector<std::string>& persistence_errors() const noexcept { return persistence_errors_; }
 
 private:
     std::filesystem::path project_root_;
@@ -169,8 +172,14 @@ private:
     std::condition_variable_any queue_ready_;
     std::queue<std::function<void()>> jobs_;
     std::jthread worker_;
+    std::filesystem::path registry_index_path_;
+    std::vector<std::pair<std::string, std::filesystem::path>> registry_records_;
+    std::vector<std::string> persistence_errors_;
+    bool restoring_registry_{};
 
     void worker_loop(std::stop_token stop_token);
+    bool save_registry_index(std::string& error);
+    void restore_registry_index();
 };
 
 const char* asset_type_name(AssetType type) noexcept;

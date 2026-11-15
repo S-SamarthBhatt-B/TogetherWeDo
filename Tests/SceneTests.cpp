@@ -42,6 +42,9 @@ int main() {
     first.model_asset_id = "model:0123456789abcdef";
     first.material_asset_id = "material:abcdef0123456789";
     first.material.base_color_texture_id = "texture:fedcba9876543210";
+    first.material.normal_texture_id = "texture:normal";
+    first.material.metallic_roughness_texture_id = "texture:metalrough";
+    first.material.occlusion_texture_id = "texture:occlusion";
     const std::string shared_model_id = first.model_asset_id;
     const std::string shared_material_id = first.material_asset_id;
     const std::string shared_texture_id = first.material.base_color_texture_id;
@@ -68,6 +71,9 @@ int main() {
         loaded_object->material.emission.x == expected_emission &&
         loaded_object->material_asset_id == shared_material_id &&
         loaded_object->material.base_color_texture_id == shared_texture_id &&
+        loaded_object->material.normal_texture_id == "texture:normal" &&
+        loaded_object->material.metallic_roughness_texture_id == "texture:metalrough" &&
+        loaded_object->material.occlusion_texture_id == "texture:occlusion" &&
         loaded_shared->material_asset_id == shared_material_id,
         "scene JSON round-trip preserves names, transforms, material values, and stable asset references");
 
